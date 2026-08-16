@@ -1,10 +1,10 @@
+import argparse
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,7 +21,8 @@ CHUNK_SIZE = 20
 TIMEOUT = 600
 CORRECTED_HASHES_FILE = "corrected_hashes.json"
 EXCLUDE_DIRS = {"Wishlist", "dump"}
-DRY_RUN = "--dry-run" in sys.argv
+DRY_RUN = False
+YES = False
 
 
 def _in_excluded(path: Path, root: Path) -> bool:
@@ -333,7 +334,7 @@ If no corrections are needed, return an empty array: []
 """
 
 
-def _http_json(method: str, url: str, payload: dict | None = None, timeout: int = TIMEOUT) -> dict:
+def _http_json(method: str, url: str, payload: dict | None = None, timeout: int | None = None) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
         url,
@@ -341,7 +342,7 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
         headers={"Content-Type": "application/json"},
         method=method,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout if timeout is not None else TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -409,6 +410,8 @@ def _select_model(context: str, models: list[dict], default_model: str,
     loaded_ids = {e["id"] for e in entries if e.get("loaded")}
     ids_set = {e["id"] for e in entries}
     default = default_model if default_model in ids_set else entries[0]["id"]
+    if YES:
+        return default
     default_num = next(i for i, e in enumerate(entries, 1) if e["id"] == default)
     print(f"    {context} — available LLMs:")
     for i, e in enumerate(entries, 1):
@@ -434,6 +437,8 @@ def _select_model(context: str, models: list[dict], default_model: str,
 
 
 def _prompt_yes_no(prompt: str) -> bool:
+    if YES:
+        return True
     return input(f"{prompt} [Y/n]: ").strip().lower() not in ("n", "no")
 
 
@@ -573,6 +578,8 @@ def _choose_backend() -> list[dict]:
     print("    [1] Local LM Studio (default) — native API (127.0.0.1:1234)")
     print("    [2] Remote LM Studio servers — sync/download/load the same model on each")
     print("    [3] Local OpenAI-compatible endpoint (current method) — 127.0.0.1:1234/v1/chat/completions")
+    if YES:
+        return _choose_local_native()
     choice = input("    Select [1]: ").strip()
     if choice == "2":
         return _choose_remote_servers()
@@ -740,6 +747,36 @@ def _embed_srt(video: Path, srt: Path) -> None:
 
 
 def main() -> None:
+    global DRY_RUN, YES, CHUNK_SIZE, TIMEOUT, LM_STUDIO_URL, LM_STUDIO_MODEL, LM_STUDIO_NATIVE
+    parser = argparse.ArgumentParser(
+        prog="transcribe.py",
+        description="Transcribe anime videos (ffmpeg + mlx-qwen3-asr), correct subtitles "
+                    "against a glossary via LM Studio, and embed them.",
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Scan and report what would be done without changing any files.")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Non-interactive: auto-accept the default answer for every prompt.")
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
+                        help=f"Subtitle cues per correction chunk (default: {CHUNK_SIZE}).")
+    parser.add_argument("--timeout", type=int, default=TIMEOUT,
+                        help=f"HTTP timeout in seconds for LLM calls (default: {TIMEOUT}).")
+    parser.add_argument("--lm-studio-url", default=LM_STUDIO_URL,
+                        help=f"OpenAI-compatible chat completions endpoint (default: {LM_STUDIO_URL}).")
+    parser.add_argument("--lm-studio-model", default=LM_STUDIO_MODEL,
+                        help=f"LM Studio model id (default: {LM_STUDIO_MODEL}).")
+    parser.add_argument("--lm-studio-native", default=LM_STUDIO_NATIVE,
+                        help=f"LM Studio native API base URL (default: {LM_STUDIO_NATIVE}).")
+    args = parser.parse_args()
+
+    DRY_RUN = args.dry_run
+    YES = args.yes
+    CHUNK_SIZE = args.chunk_size
+    TIMEOUT = args.timeout
+    LM_STUDIO_URL = args.lm_studio_url
+    LM_STUDIO_MODEL = args.lm_studio_model
+    LM_STUDIO_NATIVE = args.lm_studio_native
+
     _check_tools()
 
     root = Path(os.getcwd())
@@ -824,7 +861,7 @@ def main() -> None:
             if DRY_RUN:
                 print(f"  Would swap {len(existing)} file(s).")
             else:
-                choice = input(
+                choice = "" if YES else input(
                     "  Swap them into raw .srts now? [1] Yes (default) / [2] No: "
                 ).strip()
                 if choice in ("", "1"):
@@ -891,7 +928,7 @@ def main() -> None:
 
         if corrected_ok and not DRY_RUN:
             print()
-            choice = input(
+            choice = "" if YES else input(
                 "  Replace raw .srts with corrected versions? [1] Yes (default) / [2] No: "
             ).strip()
             if choice in ("", "1"):
