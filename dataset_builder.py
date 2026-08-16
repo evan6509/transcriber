@@ -358,6 +358,9 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", required=True, help="video library root (recursive scan)")
     ap.add_argument("--out-dir", default="./training_data", help="ALL output goes here (use the NAS mount so both machines see it)")
+    ap.add_argument("--tmp-dir", default="/tmp/dataset_asr",
+                    help="LOCAL temp dir for WAV/ASR intermediates (must be local disk — "
+                         "SMB/FUSE mounts can't seek, which breaks ffmpeg WAV writes)")
     ap.add_argument("--stage", choices=["all", "asr", "correct"], default="all",
                     help="asr: run ASR only (2070S, writes raw/). correct: run correction "
                          "only (Mac, reads raw/ -> corrected/ + training.jsonl). all: both.")
@@ -380,7 +383,7 @@ def main() -> int:
     asr_model = args.asr_model or (ASR_MODEL_MAC if IS_MAC else ASR_MODEL_CUDA)
 
     if args.stage in ("all", "asr"):
-        return run_asr_stage(root, raw_dir, ref_dir, tmp_dir, asr_model,
+        return run_asr_stage(root, raw_dir, ref_dir, Path(args.tmp_dir), asr_model,
                              args.limit, args.dry_run)
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                              args.lm_studio_url, args.min_diff, args.limit, args.dry_run)
