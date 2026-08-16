@@ -318,10 +318,13 @@ def transcribe(wav: Path, json_out: Path, model: str) -> None:
 # --------------------------------------------------------------------------- #
 # LLM correction (OpenAI-compatible)
 # --------------------------------------------------------------------------- #
-def http_json(method: str, url: str, payload=None, timeout: int = 600) -> dict:
+def http_json(method: str, url: str, payload=None, timeout: int = 600,
+              api_key: str | None = None) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urlrequest.Request(url, data=data, method=method,
-                             headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urlrequest.Request(url, data=data, method=method, headers=headers)
     with urlrequest.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -345,10 +348,11 @@ def server_has_loaded_model(chat_url: str) -> bool:
     return False
 
 
-def call_llm(prompt: str, url: str) -> str:
-    payload = {"model": "current", "messages": [{"role": "user", "content": prompt}],
+def call_llm(prompt: str, url: str, model: str = "current",
+             api_key: str | None = None) -> str:
+    payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
                "temperature": 0.0, "max_tokens": 4000}
-    data = http_json("POST", url, payload)
+    data = http_json("POST", url, payload, api_key=api_key)
     choice = data["choices"][0]
     if choice.get("finish_reason") == "length":
         print("  [WARN] response truncated (hit max_tokens) — chunk may be incomplete")
@@ -382,7 +386,8 @@ def apply_corrections(cues: list[dict], corrections: list[dict]) -> int:
     return applied
 
 
-def correct_srt(srt_path: Path, glossary_text: str, out_path: Path, url: str) -> int:
+def correct_srt(srt_path: Path, glossary_text: str, out_path: Path, url: str,
+                model: str = "current", api_key: str | None = None) -> int:
     cues = parse_srt(srt_path)
     if not cues:
         raise ValueError("no cues parsed")
@@ -394,7 +399,7 @@ def correct_srt(srt_path: Path, glossary_text: str, out_path: Path, url: str) ->
         cue_lines = "\n".join(f"[{c['id']}] {c['text']}" for c in chunk)
         prompts.append(CORRECTION_PROMPT.format(glossary=glossary_text, cues=cue_lines))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(call_llm, p, url) for p in prompts]
+        futures = [pool.submit(call_llm, p, url, model, api_key) for p in prompts]
         for fut in as_completed(futures):
             raw = fut.result()
             corrections = extract_json_array(raw)
@@ -418,7 +423,19 @@ def main() -> int:
                     help="asr: run ASR only (2070S, writes raw/). correct: run correction "
                          "only (Mac, reads raw/ -> corrected/ + training.jsonl). all: both.")
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
-    ap.add_argument("--lm-studio-url", default=LM_STUDIO_URL)
+    ap.add_argument("--lm-studio-url", default=LM_STUDIO_URL,
+                    help="OpenAI-compatible chat completions endpoint "
+                         "(LM Studio local, or a cloud endpoint like "
+                         "https://opencode.ai/zen/go/v1/chat/completions)")
+    ap.add_argument("--lm-studio-model", default="current",
+                    help="model id sent in the request (default: 'current' = whatever "
+                         "LM Studio has loaded; use the real id for cloud APIs)")
+    ap.add_argument("--api-key", default=None,
+                    help="Bearer token for cloud endpoints; if omitted, auto-read "
+                         "from ~/.config/opencode/opencode.jsonc (opencode-go)")
+    ap.add_argument("--skip-server-check", action="store_true",
+                    help="skip the 'is a model loaded?' preflight (needed for cloud "
+                         "APIs that have no loaded-model concept)")
     ap.add_argument("--asr-model", default=None,
                     help=f"ASR model (default: {ASR_MODEL_MAC if IS_MAC else ASR_MODEL_CUDA})")
     ap.add_argument("--min-diff", action="store_true",
@@ -439,11 +456,31 @@ def main() -> int:
     tmp_dir = out_dir / "tmp"
     asr_model = args.asr_model or (ASR_MODEL_MAC if IS_MAC else ASR_MODEL_CUDA)
 
+    # Auto-read the opencode-go API key if none passed (no secrets in chat).
+    api_key = args.api_key
+    if api_key is None and "opencode.ai" in args.lm_studio_url:
+        import re as _re
+        try:
+            cfg_text = Path.home().joinpath(
+                ".config/opencode/opencode.jsonc").read_text()
+            cfg_text = _re.sub(r"//.*", "", cfg_text)
+            cfg = json.loads(cfg_text)
+            for name, conf in cfg.get("provider", {}).items():
+                base = (conf.get("baseURL") or "").lower()
+                if "opencode.ai" in base:
+                    api_key = conf.get("apiKey") or conf.get("api_key")
+                    break
+        except Exception:
+            api_key = None
+        if api_key:
+            print("  [INFO] using opencode-go API key from opencode config")
+
     if args.stage in ("all", "asr"):
         return run_asr_stage(root, raw_dir, ref_dir, Path(args.tmp_dir), asr_model,
                              args.limit, args.dry_run, args.skip_existing, args.depth)
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
-                             args.lm_studio_url, args.min_diff, args.limit, args.dry_run)
+                             args.lm_studio_url, args.lm_studio_model, api_key,
+                             args.skip_server_check, args.min_diff, args.limit, args.dry_run)
 
 
 def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
@@ -568,8 +605,9 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
 
 def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
-                      chunk_size: int, lm_url: str, min_diff: bool,
-                      limit: int, dry_run: bool) -> int:
+                      chunk_size: int, lm_url: str, lm_model: str,
+                      api_key: str | None, skip_check: bool,
+                      min_diff: bool, limit: int, dry_run: bool) -> int:
     if not raw_dir.is_dir():
         print(f"[ERROR] no raw/ dir at {raw_dir} — run the ASR stage first", file=sys.stderr)
         return 1
@@ -592,10 +630,10 @@ def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
         print("dry-run complete — nothing processed")
         return 0
 
-    if not server_has_loaded_model(lm_url):
+    if not skip_check and not server_has_loaded_model(lm_url):
         print("[ERROR] No model loaded at the OpenAI-compatible endpoint "
               f"({lm_url}). Load one in LM Studio first — this script will NOT "
-              "load one for you.")
+              "load one for you. (Or pass --skip-server-check for cloud APIs.)")
         return 1
 
     n_total = n_changed = n_noop = 0
@@ -613,7 +651,7 @@ def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
             corr = corr_dir / rel.parent / f"{rel.stem}.corrected.srt"
             corr.parent.mkdir(parents=True, exist_ok=True)
             try:
-                applied = correct_srt(raw, glossary_text, corr, lm_url)
+                applied = correct_srt(raw, glossary_text, corr, lm_url, lm_model, api_key)
                 print(f"  [OK] corrected ({applied} fixes)")
             except Exception as e:
                 print(f"  [ERROR] correction failed: {e}")
