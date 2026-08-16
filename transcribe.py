@@ -11,12 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
-VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
+VIDEO_EXTS = {".mkv", ".mp4", ".mov"}
 MODEL = "mlx-community/Qwen3-ASR-1.7B-8bit"
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 LM_STUDIO_MODEL = "qwen3.6-27b"
-LM_STUDIO_NATIVE = "http://127.0.0.1:1234"
 CHUNK_SIZE = 20
 TIMEOUT = 600
 CORRECTED_HASHES_FILE = "corrected_hashes.json"
@@ -154,13 +153,11 @@ def _transcribe(audio_path: Path) -> Path:
 
 
 def _fmt_ts(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
-    if ms == 1000:
-        s += 1
-        ms = 0
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3_600_000
+    m = (total_ms % 3_600_000) // 60_000
+    s = (total_ms % 60_000) // 1000
+    ms = total_ms % 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
@@ -346,249 +343,7 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _normalize_host(raw: str) -> str:
-    s = raw.strip().rstrip("/")
-    if not s:
-        return ""
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-    if ":" in s:
-        return f"http://{s}"
-    return f"http://{s}:1234"
-
-
-def _probe_models(base: str, label: str = "") -> list[dict] | None:
-    try:
-        data = _http_json("GET", f"{base}/api/v1/models", timeout=8)
-    except Exception as e:
-        if label:
-            tail = str(e).split(":")[-1].strip()[:100] if str(e) else str(e)
-            print(f"    {label}: error — {tail}")
-        return None
-    raw_items: list | None = None
-    if isinstance(data, list):
-        raw_items = data
-    elif isinstance(data, dict):
-        for key in ("data", "models", "results"):
-            v = data.get(key)
-            if isinstance(v, list):
-                raw_items = v
-                break
-        if raw_items is None:
-            raw_items = []
-    models = []
-    for item in raw_items or []:
-        if not isinstance(item, dict):
-            continue
-        mid = item.get("key") or item.get("id") or item.get("identifier") or item.get("name")
-        if not mid:
-            continue
-        instances = item.get("loaded_instances")
-        loaded = bool(instances) if isinstance(instances, list) else (
-            item.get("state") == "loaded" or item.get("status") == "loaded"
-        )
-        models.append({"id": str(mid), "loaded": loaded, "type": item.get("type") or "llm"})
-    return models
-
-
-def _select_model(context: str, models: list[dict], default_model: str,
-                  *, shared: set[str] = (), local_ids: set[str] = ()) -> str:
-    llm = [m for m in models if m.get("type") == "llm"]
-    seen: dict[str, dict] = {}
-    for m in llm:
-        mid = m["id"]
-        if mid not in seen:
-            seen[mid] = dict(m)
-        elif m.get("loaded"):
-            seen[mid]["loaded"] = True
-    entries = list(seen.values())
-    if not entries:
-        return ""
-    def sort_key(e):
-        return (0 if e["id"] in local_ids else 1, e["id"])
-    entries.sort(key=sort_key)
-    loaded_ids = {e["id"] for e in entries if e.get("loaded")}
-    ids_set = {e["id"] for e in entries}
-    default = default_model if default_model in ids_set else entries[0]["id"]
-    if YES:
-        return default
-    default_num = next(i for i, e in enumerate(entries, 1) if e["id"] == default)
-    print(f"    {context} — available LLMs:")
-    for i, e in enumerate(entries, 1):
-        m = f"      [{i}] {e['id']}"
-        if e["id"] in loaded_ids:
-            m += "  *"
-        if e["id"] in shared:
-            m += "  (all servers)"
-        print(m)
-    while True:
-        raw = input(f"    Select model number [default {default_num} ({default})]: ").strip()
-        if not raw:
-            return default
-        if raw in ids_set:
-            return raw
-        try:
-            n = int(raw)
-            if 1 <= n <= len(entries):
-                return entries[n - 1]["id"]
-        except ValueError:
-            pass
-        print(f"    Invalid. Enter a number 1–{len(entries)} or the model id.")
-
-
-def _prompt_yes_no(prompt: str) -> bool:
-    if YES:
-        return True
-    return input(f"{prompt} [Y/n]: ").strip().lower() not in ("n", "no")
-
-
-def _ensure_model(base: str, model: str, allow_download: bool) -> bool:
-    models = _probe_models(base)
-    if models is None:
-        print(f"  [WARN] {base}: server unreachable — skipping")
-        return False
-    ids = [m["id"] for m in models]
-    if model not in ids:
-        if not allow_download or not _prompt_yes_no(
-            f"  {base}: model '{model}' is not installed. Download it (can be large)?"
-        ):
-            print(f"  [WARN] {base}: model '{model}' not installed — skipping")
-            return False
-        try:
-            job = _http_json("POST", f"{base}/api/v1/models/download", {"model": model}, timeout=30)
-        except Exception as e:
-            print(f"  [ERROR] {base}: download start failed: {e}")
-            return False
-        job_id = job.get("job_id") or job.get("id")
-        if not job_id:
-            print(f"  [ERROR] {base}: no job_id in download response: {job}")
-            return False
-        for _ in range(300):
-            try:
-                st = _http_json("GET", f"{base}/api/v1/models/download/status/{job_id}", timeout=30)
-            except Exception as e:
-                print(f"  [ERROR] {base}: download status error: {e}")
-                return False
-            status = st.get("status")
-            print(f"  {base}: download status = {status}")
-            if status in ("completed", "done"):
-                break
-            if status == "failed":
-                print(f"  [ERROR] {base}: model download failed")
-                return False
-            time.sleep(3)
-        else:
-            print(f"  [ERROR] {base}: download timed out")
-            return False
-        models = _probe_models(base) or []
-    if not any(m.get("loaded") for m in models if m["id"] == model):
-        try:
-            _http_json("POST", f"{base}/api/v1/models/load", {"model": model}, timeout=120)
-            print(f"  {base}: loaded {model}")
-        except Exception as e:
-            print(f"  [ERROR] {base}: model load failed: {e}")
-            return False
-    return True
-
-
-def _pick_model(host: str, models: list[dict]) -> str:
-    ids = {m["id"] for m in models if m.get("type") == "llm"}
-    if not ids:
-        return ""
-    preferred = next((i for i in ids if LM_STUDIO_MODEL in i.lower()),
-                     next((i for i in ids if "qwen" in i.lower()),
-                          next(iter(ids))))
-    return _select_model(host, models, preferred)
-
-
-def _choose_local_native() -> list[dict]:
-    base = LM_STUDIO_NATIVE
-    models = _probe_models(base)
-    if not models:
-        print("  [WARN] Local native API unreachable/empty — falling back to OpenAI-compatible endpoint.")
-        return [{"base": LM_STUDIO_URL, "protocol": "openai", "model": LM_STUDIO_MODEL}]
-    model = _pick_model("127.0.0.1", models)
-    if _ensure_model(base, model, allow_download=True):
-        return [{"base": base, "protocol": "native", "model": model}]
-    return [{"base": LM_STUDIO_URL, "protocol": "openai", "model": LM_STUDIO_MODEL}]
-
-
-def _choose_remote_servers() -> list[dict]:
-    raw = input(
-        "    Enter server IPs (space/comma separated, e.g. 192.168.1.10 192.168.1.11:1235)\n    -> "
-    ).strip()
-    hosts = [h for h in re.split(r"[,\s]+", raw) if h]
-    if not hosts:
-        print("    No servers entered — falling back to local LM Studio.")
-        return _choose_local_native()
-    bases = [_normalize_host(h) for h in hosts]
-    probed = []
-    for base in bases:
-        models = None
-        for attempt in range(2):
-            models = _probe_models(base, label=base)
-            if models is not None:
-                break
-            if attempt == 0:
-                print(f"    {base}: retrying...")
-        probed.append((base, models))
-    for base, models in probed:
-        if models is None:
-            print(f"    {base}: unreachable")
-        else:
-            detail = ", ".join(f"{m['id']}{'*' if m.get('loaded') else ''}" for m in models) or "(no models)"
-            print(f"    {base}: {detail}")
-    live = [(base, m) for base, m in probed if m is not None]
-    if not live:
-        print("  Remote servers unreachable — falling back to local.")
-        return _choose_local_native()
-    live_llm = [(base, [m for m in models if m.get("type") == "llm"]) for base, models in live]
-    all_ids = sorted({m["id"] for _, models in live_llm for m in models})
-    if not all_ids:
-        print("  Reachable servers but no LLM models installed — falling back to local.")
-        return _choose_local_native()
-    shared = {i for i in all_ids if all(i in [m["id"] for m in models] for _, models in live_llm)}
-    candidates = list(shared) if shared else all_ids
-    default_model = next((i for i in candidates if LM_STUDIO_MODEL in i.lower()),
-                         next((i for i in candidates if "qwen" in i.lower()),
-                              candidates[0]))
-    local_base = _normalize_host(LM_STUDIO_NATIVE)
-    local_ids = set()
-    for base, models in live_llm:
-        if base == local_base:
-            local_ids = {m["id"] for m in models}
-            break
-    all_raw: list[dict] = []
-    for _, models in live:
-        all_raw.extend(models)
-    model = _select_model("every server", all_raw, default_model, shared=shared, local_ids=local_ids)
-    endpoints = []
-    for base, _ in live:
-        if _ensure_model(base, model, allow_download=True):
-            endpoints.append({"base": base, "protocol": "native", "model": model})
-    if not endpoints:
-        print("  No servers could load the model — falling back to local.")
-        return _choose_local_native()
-    print(f"    Using {len(endpoints)} server(s) with model '{model}'.")
-    return endpoints
-
-
-def _choose_backend() -> list[dict]:
-    print("  Correction backend:")
-    print("    [1] Local LM Studio (default) — native API (127.0.0.1:1234)")
-    print("    [2] Remote LM Studio servers — sync/download/load the same model on each")
-    print("    [3] Local OpenAI-compatible endpoint (current method) — 127.0.0.1:1234/v1/chat/completions")
-    if YES:
-        return _choose_local_native()
-    choice = input("    Select [1]: ").strip()
-    if choice == "2":
-        return _choose_remote_servers()
-    if choice == "3":
-        return [{"base": LM_STUDIO_URL, "protocol": "openai", "model": LM_STUDIO_MODEL}]
-    return _choose_local_native()
-
-
-def _call_llm_openai(prompt: str, endpoint: dict) -> str:
+def _call_llm(prompt: str, endpoint: dict) -> str:
     payload = {
         "model": endpoint["model"],
         "messages": [{"role": "user", "content": prompt}],
@@ -602,40 +357,15 @@ def _call_llm_openai(prompt: str, endpoint: dict) -> str:
     return choice["message"]["content"]
 
 
-def _call_llm_native(prompt: str, endpoint: dict) -> str:
-    payload = {
-        "model": endpoint["model"],
-        "input": prompt,
-        "temperature": 0.0,
-        "max_output_tokens": 4000,
-        "store": False,
-    }
-    data = _http_json("POST", f"{endpoint['base']}/api/v1/chat", payload)
-    parts = [
-        item["content"]
-        for item in data.get("output", [])
-        if isinstance(item, dict) and item.get("type") == "message"
-    ]
-    stats = data.get("stats") or {}
-    if stats.get("total_output_tokens", 0) >= 4000:
-        print("  [WARN] Response likely truncated (hit max_output_tokens) — chunk may be incomplete")
-    return "".join(parts)
-
-
-def _call_llm(prompt: str, endpoint: dict) -> str:
-    if endpoint.get("protocol") == "native":
-        return _call_llm_native(prompt, endpoint)
-    return _call_llm_openai(prompt, endpoint)
-
-
 def _run_chunk(prompt: str, endpoints: list[dict], idx: int) -> str:
-    attempts = min(len(endpoints), 2)
     last = None
-    for offset in range(attempts):
+    for attempt in range(3):
         try:
-            return _call_llm(prompt, endpoints[(idx + offset) % len(endpoints)])
+            return _call_llm(prompt, endpoints[idx % len(endpoints)])
         except Exception as e:
             last = e
+            if attempt < 2:
+                time.sleep(2 + attempt)
     raise last
 
 
@@ -661,8 +391,9 @@ def _apply_corrections(cues: list[dict], corrections: list[dict]) -> int:
         correct = corr.get("correct")
         if not cue or not wrong or not correct:
             continue
-        if wrong in cue["text"]:
-            cue["text"] = cue["text"].replace(wrong, correct)
+        pattern = re.compile(rf"\b{re.escape(wrong)}\b", re.IGNORECASE)
+        if pattern.search(cue["text"]):
+            cue["text"] = pattern.sub(correct, cue["text"])
             applied += 1
     return applied
 
@@ -679,7 +410,7 @@ def _correct_srt_file(srt_path: Path, glossary_text: str, endpoints: list[dict])
 
     total_applied = 0
     chunks = list(_chunked(cues, CHUNK_SIZE))
-    workers = min(len(chunks), 5 * len(endpoints))
+    workers = min(len(chunks), 3)
     prompts = [_build_correction_prompt(c, glossary_text) for c in chunks]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
@@ -709,10 +440,10 @@ def _find_glossary(start: Path, root: Path) -> Path | None:
     return None
 
 
-_SUB_CODEC = {".mp4": "mov_text", ".mkv": "srt"}
+_SUB_CODEC = {".mp4": "mov_text", ".mkv": "srt", ".mov": "mov_text"}
 
 
-_FMT_MAP = {".mp4": "mp4", ".mkv": "matroska", ".avi": "avi", ".mov": "mov"}
+_FMT_MAP = {".mp4": "mp4", ".mkv": "matroska", ".mov": "mov"}
 
 
 def _embed_srt(video: Path, srt: Path) -> None:
@@ -720,7 +451,7 @@ def _embed_srt(video: Path, srt: Path) -> None:
     fmt = _FMT_MAP.get(video.suffix.lower())
     if codec is None or fmt is None:
         return
-    # Write temp file in the SAME directory with a valid .mkv/.mp4 extension
+    # Write temp file in the SAME directory with a valid .mkv/.mp4/.mov extension
     # (CIFS rejects .tmp extensions; ffmpeg can't guess the format)
     tmp = video.with_suffix(".embed_tmp" + video.suffix)
     cmd = [
@@ -747,7 +478,7 @@ def _embed_srt(video: Path, srt: Path) -> None:
 
 
 def main() -> None:
-    global DRY_RUN, YES, CHUNK_SIZE, TIMEOUT, LM_STUDIO_URL, LM_STUDIO_MODEL, LM_STUDIO_NATIVE
+    global DRY_RUN, YES, CHUNK_SIZE, TIMEOUT, LM_STUDIO_URL, LM_STUDIO_MODEL
     parser = argparse.ArgumentParser(
         prog="transcribe.py",
         description="Transcribe anime videos (ffmpeg + mlx-qwen3-asr), correct subtitles "
@@ -765,8 +496,6 @@ def main() -> None:
                         help=f"OpenAI-compatible chat completions endpoint (default: {LM_STUDIO_URL}).")
     parser.add_argument("--lm-studio-model", default=LM_STUDIO_MODEL,
                         help=f"LM Studio model id (default: {LM_STUDIO_MODEL}).")
-    parser.add_argument("--lm-studio-native", default=LM_STUDIO_NATIVE,
-                        help=f"LM Studio native API base URL (default: {LM_STUDIO_NATIVE}).")
     args = parser.parse_args()
 
     DRY_RUN = args.dry_run
@@ -775,7 +504,6 @@ def main() -> None:
     TIMEOUT = args.timeout
     LM_STUDIO_URL = args.lm_studio_url
     LM_STUDIO_MODEL = args.lm_studio_model
-    LM_STUDIO_NATIVE = args.lm_studio_native
 
     _check_tools()
 
@@ -895,9 +623,7 @@ def main() -> None:
                 skipped_already += 1
                 continue
             to_correct.append((srt_path, glossary_text))
-        endpoints = []
-        if to_correct and not DRY_RUN:
-            endpoints = _choose_backend()
+        endpoints = [{"base": LM_STUDIO_URL, "model": LM_STUDIO_MODEL}]
         corrected_ok = 0
         corrected_fail = 0
         for idx, (srt_path, glossary_text) in enumerate(to_correct, 1):
