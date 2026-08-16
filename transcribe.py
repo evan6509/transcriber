@@ -1,3 +1,15 @@
+"""Transcribe anime videos into .srt subtitles, correct them against a glossary via
+LM Studio, and embed them back into the video containers.
+
+Cross-platform ASR backend (single script):
+- macOS (Apple Silicon): runs the `mlx-qwen3-asr` CLI (MLX). Torch/transformers are
+  never imported on macOS, so they are not required to be installed there.
+- Linux + NVIDIA (CUDA): runs Qwen3-ASR directly with `torch` + `transformers` on a
+  CUDA GPU (lazy-imported inside the CUDA branch). Uses a forced aligner for
+  word-level timestamps, chunking long audio at low-energy boundaries.
+Both backends emit the same JSON shape ({segments, chunks}) consumed by _json_to_srt.
+"""
+
 import argparse
 import hashlib
 import json
@@ -10,9 +22,13 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+IS_MAC = sys.platform == "darwin"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov"}
 MODEL = "mlx-community/Qwen3-ASR-1.7B-8bit"
+# transformers-native checkpoints for the Linux/CUDA path (verified on the HF hub):
+CUDA_MODEL = "Qwen/Qwen3-ASR-1.7B-hf"
+CUDA_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 LM_STUDIO_MODEL = "qwen3.6-27b"
@@ -22,6 +38,11 @@ CORRECTED_HASHES_FILE = "corrected_hashes.json"
 EXCLUDE_DIRS = {"Wishlist", "dump"}
 DRY_RUN = False
 YES = False
+
+# CUDA ASR tuning (mirrors the qwen-asr package's reference limits).
+SAMPLE_RATE = 16000
+CUDA_CHUNK_SEC = 180.0
+CUDA_MAX_NEW_TOKENS = 2048
 
 
 def _in_excluded(path: Path, root: Path) -> bool:
@@ -49,7 +70,17 @@ def _check_tool(name: str) -> None:
 
 def _check_tools() -> None:
     _check_tool("ffmpeg")
-    _check_tool("mlx-qwen3-asr")
+    if IS_MAC:
+        _check_tool("mlx-qwen3-asr")
+        return
+    _check_tool("ffprobe")
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is None or not torch.cuda.is_available():
+        print("[ERROR] Qwen3-ASR CUDA path requires torch with CUDA; on macOS use mlx-qwen3-asr instead")
+        sys.exit(1)
 
 
 def _is_appledouble(path: Path) -> bool:
@@ -136,11 +167,17 @@ def _extract_audio(video: Path, dst: Path) -> None:
     subprocess.run(cmd, check=True, capture_output=True)
 
 
-def _transcribe(audio_path: Path) -> Path:
+def _transcribe(audio_path: Path, model_id: str = MODEL) -> Path:
+    if IS_MAC:
+        return _transcribe_mlx(audio_path, model_id)
+    return _transcribe_cuda(audio_path, model_id)
+
+
+def _transcribe_mlx(audio_path: Path, model_id: str) -> Path:
     output_path = audio_path.with_suffix(".json")
     cmd = [
         "mlx-qwen3-asr",
-        "--model", MODEL,
+        "--model", model_id,
         "--language", "english",
         "--output-format", "json",
         "--output-dir", str(audio_path.parent),
@@ -149,6 +186,165 @@ def _transcribe(audio_path: Path) -> Path:
         str(audio_path),
     ]
     subprocess.run(cmd, check=True)
+    return output_path
+
+
+def _read_wav_float32(audio_path: Path) -> "np.ndarray":
+    """Read a 16 kHz mono WAV (as written by _extract_audio) into a float32 array."""
+    import wave
+    import numpy as np
+
+    with wave.open(str(audio_path), "rb") as wav:
+        n_channels = wav.getnchannels()
+        sampwidth = wav.getsampwidth()
+        raw = wav.readframes(wav.getnframes())
+    if sampwidth == 2:
+        pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif sampwidth == 4:
+        pcm = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    elif sampwidth == 1:
+        pcm = (np.frombuffer(raw, dtype="<u1").astype(np.float32) - 128.0) / 128.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sampwidth} byte(s)")
+    if n_channels > 1:
+        pcm = pcm.reshape(-1, n_channels)[:, 0]
+    return np.asarray(pcm, dtype=np.float32)
+
+
+def _split_long_audio(wav, sr: int, max_chunk_sec: float):
+    """Split long audio into <=max_chunk_sec chunks at low-energy boundaries.
+
+    Mirrors qwen-asr's split_audio_into_chunks: concatenating the returned
+    chunks reproduces the input exactly (no overlaps, no gaps). Returns a list
+    of (chunk_wav, offset_sec) pairs.
+    """
+    import numpy as np
+
+    wav = np.asarray(wav, dtype=np.float32)
+    total_len = int(wav.shape[0])
+    total_sec = total_len / float(sr)
+    if total_sec <= max_chunk_sec:
+        return [(wav, 0.0)]
+
+    max_len = int(max_chunk_sec * sr)
+    expand = int(5.0 * sr)
+    win = max(4, int(0.1 * sr))
+
+    chunks = []
+    start = 0
+    offset = 0.0
+    while (total_len - start) > max_len:
+        cut = start + max_len
+        left = max(start, cut - expand)
+        right = min(total_len, cut + expand)
+        if right - left <= win:
+            boundary = cut
+        else:
+            seg = wav[left:right]
+            window_sums = np.convolve(np.abs(seg), np.ones(win, dtype=np.float32), mode="valid")
+            min_pos = int(np.argmin(window_sums))
+            boundary = left + min_pos + int(np.argmin(np.abs(seg[min_pos : min_pos + win])))
+        boundary = int(max(boundary, start + 1))
+        boundary = int(min(boundary, total_len))
+        chunks.append((wav[start:boundary], offset))
+        offset += (boundary - start) / float(sr)
+        start = boundary
+    chunks.append((wav[start:total_len], offset))
+    return chunks
+
+
+def _join_words(texts: list[str]) -> str:
+    text = " ".join(t for t in texts if t)
+    return re.sub(r"\s+([,.;:!?，。！？；：])", r"\1", text).strip()
+
+
+def _words_to_chunks(word_items: list[dict]) -> list[dict]:
+    """Group word-level timestamps into sentence-sized chunks for _json_to_srt.
+
+    Emits {"text", "start", "end"} dicts; start/end are floats in seconds. A
+    chunk is flushed at sentence-ending punctuation (or every 80 words as a
+    safety cap), skipping single-word abbreviations like "Mr."/"Dr.".
+    """
+    chunks = []
+    cur = []
+    for item in word_items:
+        cur.append(item)
+        text = item["text"]
+        is_end = text.endswith(("。", "！", "？", ".", "!", "?"))
+        if text.endswith(".") and len(cur) == 1 and re.match(r"^[A-Za-z]{1,4}\.$", text):
+            is_end = False  # abbreviation, not a sentence end
+        if (is_end and len(cur) >= 2) or len(cur) >= 80:
+            joined = _join_words([w["text"] for w in cur])
+            if joined:
+                chunks.append({"text": joined, "start": float(cur[0]["start"]), "end": float(cur[-1]["end"])})
+            cur = []
+    if cur:
+        joined = _join_words([w["text"] for w in cur])
+        if joined:
+            chunks.append({"text": joined, "start": float(cur[0]["start"]), "end": float(cur[-1]["end"])})
+    return chunks
+
+
+def _transcribe_cuda(audio_path: Path, model_id: str) -> Path:
+    output_path = audio_path.with_suffix(".json")
+    import torch
+    from transformers import (
+        AutoModelForMultimodalLM,
+        AutoModelForTokenClassification,
+        AutoProcessor,
+    )
+
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    audio = _read_wav_float32(audio_path)
+    pieces = _split_long_audio(audio, SAMPLE_RATE, CUDA_CHUNK_SEC)
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForMultimodalLM.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
+
+    aligner_processor = AutoProcessor.from_pretrained(CUDA_ALIGNER_MODEL)
+    aligner = AutoModelForTokenClassification.from_pretrained(
+        CUDA_ALIGNER_MODEL, torch_dtype=dtype
+    ).to(device).eval()
+
+    word_items = []
+    try:
+        with torch.no_grad():
+            for chunk_wav, offset in pieces:
+                inputs = processor.apply_transcription_request(
+                    audio=chunk_wav, language="English"
+                ).to(device, dtype)
+                output_ids = model.generate(**inputs, max_new_tokens=CUDA_MAX_NEW_TOKENS)
+                generated = output_ids[:, inputs["input_ids"].shape[1]:]
+                parsed = processor.decode(generated, return_format="parsed")[0]
+                text = (parsed.get("transcription") or "").strip()
+                language = parsed.get("language") or "English"
+                if not text:
+                    continue
+                align_inputs, word_lists = aligner_processor.prepare_forced_aligner_inputs(
+                    audio=chunk_wav, transcript=text, language=language,
+                )
+                align_inputs = align_inputs.to(device, dtype)
+                align_out = aligner(**align_inputs)
+                timestamps = aligner_processor.decode_forced_alignment(
+                    logits=align_out.logits,
+                    input_ids=align_inputs["input_ids"],
+                    word_lists=word_lists,
+                    timestamp_token_id=aligner.config.timestamp_token_id,
+                )[0]
+                for item in timestamps:
+                    word_items.append({
+                        "text": item["text"],
+                        "start": round(float(item["start_time"]) + offset, 3),
+                        "end": round(float(item["end_time"]) + offset, 3),
+                    })
+    finally:
+        del model, aligner
+        torch.cuda.empty_cache()
+
+    chunks = _words_to_chunks(word_items)
+    output_path.write_text(json.dumps({"segments": [], "chunks": chunks}, ensure_ascii=False, indent=2))
     return output_path
 
 
@@ -481,13 +677,15 @@ def main() -> None:
     global DRY_RUN, YES, CHUNK_SIZE, TIMEOUT, LM_STUDIO_URL, LM_STUDIO_MODEL
     parser = argparse.ArgumentParser(
         prog="transcribe.py",
-        description="Transcribe anime videos (ffmpeg + mlx-qwen3-asr), correct subtitles "
+        description="Transcribe anime videos (macOS MLX / Linux CUDA), correct subtitles "
                     "against a glossary via LM Studio, and embed them.",
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Scan and report what would be done without changing any files.")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Non-interactive: auto-accept the default answer for every prompt.")
+    parser.add_argument("--asr-model", default=(MODEL if IS_MAC else CUDA_MODEL),
+                        help=f"ASR model id (default: {MODEL if IS_MAC else CUDA_MODEL}).")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                         help=f"Subtitle cues per correction chunk (default: {CHUNK_SIZE}).")
     parser.add_argument("--timeout", type=int, default=TIMEOUT,
@@ -541,7 +739,7 @@ def main() -> None:
             # Write WAV beside the video on the NAS — same volume, cleaned up after.
             tmp_wav = video.with_suffix(".extract_tmp.wav")
             _extract_audio(video, tmp_wav)
-            tmp_json = _transcribe(tmp_wav)
+            tmp_json = _transcribe(tmp_wav, args.asr_model)
             target_srt = video.with_suffix(".en.srt")
             _json_to_srt(tmp_json, target_srt)
             succeeded.append(name)
