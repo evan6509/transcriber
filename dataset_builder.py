@@ -215,15 +215,23 @@ def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
     audio, sr = sf.read(str(wav))
     if sr != 16000:
         raise RuntimeError(f"expected 16kHz WAV, got {sr}")
+    # Chunk the audio so the mel feature tensor stays small on 8GB GPUs
+    # (a full episode's features alone can exceed VRAM). 30s segments keep
+    # input_features ~200MB and also give us usable per-segment timestamps.
+    seg_samples = 16000 * 30
+    chunks = []
     with torch.no_grad():
-        inputs = processor(audio=audio, sampling_rate=sr, return_tensors="pt").to(device)
-        outputs = asr_model.generate(**inputs)
-        chunks = []
-        # best-effort timed segments: keep it simple — one chunk per ASR utterance
-        text = processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()
-        if text:
-            chunks.append({"text": text, "start": 0.0,
-                           "end": float(len(audio)) / sr})
+        for start in range(0, len(audio), seg_samples):
+            seg = audio[start : start + seg_samples]
+            # Official Qwen3-ASR entry point (handles text/audio token alignment)
+            inputs = processor.apply_transcription_request(audio=seg).to(device, asr_model.dtype)
+            outputs = asr_model.generate(**inputs, max_new_tokens=512)
+            gen_ids = outputs[:, inputs["input_ids"].shape[1] :]
+            text = processor.decode(gen_ids, return_format="transcription_only")[0].strip()
+            if text:
+                chunks.append({"text": text,
+                               "start": start / sr,
+                               "end": min((start + len(seg)) / sr, len(audio) / sr)})
     del asr_model
     torch.cuda.empty_cache()
     json_out.write_text(json.dumps({"segments": [], "chunks": chunks}), encoding="utf-8")
@@ -371,6 +379,8 @@ def main() -> int:
     ap.add_argument("--min-diff", action="store_true",
                     help="skip no-op chunks (raw == corrected) in training.jsonl")
     ap.add_argument("--limit", type=int, default=0, help="process only first N videos (test)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip videos that already have a raw srt in out-dir (resumable runs)")
     ap.add_argument("--dry-run", action="store_true", help="scan + plan only, no processing")
     args = ap.parse_args()
 
@@ -384,13 +394,13 @@ def main() -> int:
 
     if args.stage in ("all", "asr"):
         return run_asr_stage(root, raw_dir, ref_dir, Path(args.tmp_dir), asr_model,
-                             args.limit, args.dry_run)
+                             args.limit, args.dry_run, args.skip_existing)
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                              args.lm_studio_url, args.min_diff, args.limit, args.dry_run)
 
 
 def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
-                  asr_model: str, limit: int, dry_run: bool) -> int:
+                  asr_model: str, limit: int, dry_run: bool, skip_existing: bool = False) -> int:
     videos = sorted(p for p in root.rglob("*")
                     if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("._"))
     if not videos:
@@ -414,6 +424,12 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
     done = skipped = failed = 0
     for idx, video in enumerate(videos, 1):
         rel = video.relative_to(root)
+        rel_out = rel.parent / f"{rel.stem}.srt"
+        raw_srt = raw_dir / rel_out
+        if skip_existing and raw_srt.exists():
+            print(f"[{idx}/{len(videos)}] {rel} — already done, skipping")
+            skipped += 1
+            continue
         print(f"[{idx}/{len(videos)}] {rel}")
         info = probe_video(video)
         if not has_english_audio(info):
@@ -427,10 +443,8 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
         # Mirror the library tree under raw_dir so the correction stage can
         # find glossaries via the original video's parent folder.
-        rel_out = rel.parent / f"{rel.stem}.srt"
         wav = tmp_dir / f"{video.stem}.wav"
         asr_json = tmp_dir / f"{video.stem}.json"
-        raw_srt = raw_dir / rel_out
         raw_srt.parent.mkdir(parents=True, exist_ok=True)
         try:
             extract_audio(video, wav)
