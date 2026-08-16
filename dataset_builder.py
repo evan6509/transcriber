@@ -466,9 +466,18 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
         return 0
 
     done = skipped = failed = 0
-    extract_pool = ThreadPoolExecutor(max_workers=depth,
+    # max_workers is deliberately LOWER than the depth window: 3 steady readers
+    # (staggered by the queue) keep the network flowing continuously instead of
+    # bursty 6-way spikes, and the GPU never waits on a full-batch refill.
+    extract_pool = ThreadPoolExecutor(max_workers=min(3, depth),
                                       thread_name_prefix="extract")
     futures: dict[int, tuple[Path, "concurrent.futures.Future"]] = {}
+    # Prime the pipeline: submit the first `depth` extractions before the loop
+    # so the GPU starts as soon as the first wav lands.
+    for ahead in range(1, min(depth, len(videos)) + 1):
+        nv = videos[ahead - 1]
+        nwav = tmp_dir / f"{ahead:04d}_{nv.stem}.wav"
+        futures[ahead] = (nwav, extract_pool.submit(extract_audio, nv, nwav))
     for idx, video in enumerate(videos, 1):
         rel = video.relative_to(root)
         rel_out = rel.parent / f"{rel.stem}.srt"
@@ -524,6 +533,16 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
                 failed += 1
                 continue
 
+        # Pipeline overlap: submit extractions for the NEXT `depth` videos
+        # BEFORE this video's ASR runs, so the pool pulls wavs while the GPU
+        # transcribes — when the loop advances, the next wav is ready.
+        for ahead in range(idx + 1, min(idx + depth, len(videos)) + 1):
+            if ahead in futures:
+                continue
+            nv = videos[ahead - 1]
+            nwav = tmp_dir / f"{ahead:04d}_{nv.stem}.wav"
+            futures[ahead] = (nwav, extract_pool.submit(extract_audio, nv, nwav))
+
         try:
             transcribe(wav, asr_json, asr_model)
             asr_to_srt(asr_json, raw_srt)
@@ -538,15 +557,6 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
         finally:
             for p in (wav, asr_json):
                 p.unlink(missing_ok=True)
-
-        # Pipeline overlap: keep up to `depth` extractions running ahead so the
-        # GPU never waits on the SMB read + ffmpeg extract.
-        for ahead in range(idx + 1, min(idx + depth, len(videos)) + 1):
-            if ahead in futures:
-                continue
-            nv = videos[ahead - 1]
-            nwav = tmp_dir / f"{ahead:04d}_{nv.stem}.wav"
-            futures[ahead] = (nwav, extract_pool.submit(extract_audio, nv, nwav))
 
     extract_pool.shutdown(wait=False)
     print(f"\nASR done: {done} ok, {skipped} skipped, {failed} failed")
