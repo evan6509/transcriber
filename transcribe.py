@@ -31,7 +31,7 @@ CUDA_MODEL = "Qwen/Qwen3-ASR-1.7B-hf"
 CUDA_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
-LM_STUDIO_MODEL = "qwen3.6-27b"
+LM_STUDIO_MODEL = "current"
 CHUNK_SIZE = 20
 TIMEOUT = 600
 CORRECTED_HASHES_FILE = "corrected_hashes.json"
@@ -539,6 +539,32 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _server_has_loaded_model(chat_url: str) -> bool:
+    """True if the OpenAI-compatible server reports a loaded model.
+
+    The script NEVER triggers a model load — it only uses what the server
+    already has loaded. Returns False if the server is unreachable, errors,
+    or has no loaded model (caller treats that as 'load a model yourself').
+    """
+    base = chat_url.rsplit("/chat/completions", 1)[0]  # .../v1
+    try:
+        data = _http_json("GET", f"{base}/models", timeout=8)
+    except Exception:
+        return False
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        instances = item.get("loaded_instances")
+        if isinstance(instances, list) and instances:
+            return True
+        if item.get("state") == "loaded" or item.get("status") == "loaded":
+            return True
+    return False
+
+
 def _call_llm(prompt: str, endpoint: dict) -> str:
     payload = {
         "model": endpoint["model"],
@@ -822,21 +848,29 @@ def main() -> None:
                 continue
             to_correct.append((srt_path, glossary_text))
         endpoints = [{"base": LM_STUDIO_URL, "model": LM_STUDIO_MODEL}]
-        corrected_ok = 0
-        corrected_fail = 0
-        for idx, (srt_path, glossary_text) in enumerate(to_correct, 1):
-            total = len(to_correct)
-            if DRY_RUN:
-                print(f"  [{idx}/{total}] Would correct {srt_path.name}")
-                corrected_ok += 1
-                continue
-            print(f"  [{idx}/{total}] Correcting {srt_path.name}...")
-            try:
-                _correct_srt_file(srt_path, glossary_text, endpoints)
-                corrected_ok += 1
-            except Exception as e:
-                print(f"  [ERROR] {srt_path.name}: {e}")
-                corrected_fail += 1
+        if to_correct and not DRY_RUN and not _server_has_loaded_model(endpoints[0]["base"]):
+            print("  [ERROR] No model is loaded in LM Studio (nothing served at "
+                  f"{endpoints[0]['base']}). Load a model first, then re-run — "
+                  "the script will NOT load one for you.")
+            print("  Skipping the correction phase.")
+            corrected_ok = 0
+            corrected_fail = 0
+        else:
+            corrected_ok = 0
+            corrected_fail = 0
+            for idx, (srt_path, glossary_text) in enumerate(to_correct, 1):
+                total = len(to_correct)
+                if DRY_RUN:
+                    print(f"  [{idx}/{total}] Would correct {srt_path.name}")
+                    corrected_ok += 1
+                    continue
+                print(f"  [{idx}/{total}] Correcting {srt_path.name}...")
+                try:
+                    _correct_srt_file(srt_path, glossary_text, endpoints)
+                    corrected_ok += 1
+                except Exception as e:
+                    print(f"  [ERROR] {srt_path.name}: {e}")
+                    corrected_fail += 1
         print()
         parts = []
         if corrected_ok:
