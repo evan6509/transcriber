@@ -217,21 +217,29 @@ def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
         raise RuntimeError(f"expected 16kHz WAV, got {sr}")
     # Chunk the audio so the mel feature tensor stays small on 8GB GPUs
     # (a full episode's features alone can exceed VRAM). 30s segments keep
-    # input_features ~200MB and also give us usable per-segment timestamps.
+    # input_features ~200MB; ASR_BATCH of them per generate() call keeps the
+    # GPU busy (batch=1 on a 1.7B model underutilizes the card).
     seg_samples = 16000 * 30
+    ASR_BATCH = 4
+    starts = list(range(0, len(audio), seg_samples))
     chunks = []
     with torch.no_grad():
-        for start in range(0, len(audio), seg_samples):
-            seg = audio[start : start + seg_samples]
-            # Official Qwen3-ASR entry point (handles text/audio token alignment)
-            inputs = processor.apply_transcription_request(audio=seg).to(device, asr_model.dtype)
+        for b in range(0, len(starts), ASR_BATCH):
+            batch_starts = starts[b : b + ASR_BATCH]
+            segs = [audio[s : s + seg_samples] for s in batch_starts]
+            # Official Qwen3-ASR entry point (handles text/audio token alignment);
+            # accepts a list of audios -> batched inference.
+            inputs = processor.apply_transcription_request(audio=segs).to(device, asr_model.dtype)
             outputs = asr_model.generate(**inputs, max_new_tokens=512)
-            gen_ids = outputs[:, inputs["input_ids"].shape[1] :]
-            text = processor.decode(gen_ids, return_format="transcription_only")[0].strip()
-            if text:
-                chunks.append({"text": text,
-                               "start": start / sr,
-                               "end": min((start + len(seg)) / sr, len(audio) / sr)})
+            seq_len = inputs["input_ids"].shape[1]
+            for j, out in enumerate(outputs):
+                gen_ids = out[None, seq_len:]
+                text = processor.decode(gen_ids, return_format="transcription_only")[0].strip()
+                if text:
+                    s = batch_starts[j]
+                    chunks.append({"text": text,
+                                   "start": s / sr,
+                                   "end": min((s + len(segs[j])) / sr, len(audio) / sr)})
     del asr_model
     torch.cuda.empty_cache()
     json_out.write_text(json.dumps({"segments": [], "chunks": chunks}), encoding="utf-8")
@@ -379,6 +387,8 @@ def main() -> int:
     ap.add_argument("--min-diff", action="store_true",
                     help="skip no-op chunks (raw == corrected) in training.jsonl")
     ap.add_argument("--limit", type=int, default=0, help="process only first N videos (test)")
+    ap.add_argument("--depth", type=int, default=3,
+                    help="how many videos ahead to extract audio (pipeline overlap)")
     ap.add_argument("--skip-existing", action="store_true",
                     help="skip videos that already have a raw srt in out-dir (resumable runs)")
     ap.add_argument("--dry-run", action="store_true", help="scan + plan only, no processing")
@@ -422,6 +432,9 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
         return 0
 
     done = skipped = failed = 0
+    extract_pool = ThreadPoolExecutor(max_workers=args.depth,
+                                      thread_name_prefix="extract")
+    futures: dict[int, tuple[Path, "concurrent.futures.Future"]] = {}
     for idx, video in enumerate(videos, 1):
         rel = video.relative_to(root)
         rel_out = rel.parent / f"{rel.stem}.srt"
@@ -443,11 +456,38 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
         # Mirror the library tree under raw_dir so the correction stage can
         # find glossaries via the original video's parent folder.
-        wav = tmp_dir / f"{video.stem}.wav"
-        asr_json = tmp_dir / f"{video.stem}.json"
+        # idx-prefixed temp names avoid collisions when two videos share a stem.
+        wav = tmp_dir / f"{idx:04d}_{video.stem}.wav"
+        asr_json = tmp_dir / f"{idx:04d}_{video.stem}.json"
         raw_srt.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use the prefetched wav if a worker extracted it, else extract now.
+        entry = futures.pop(idx, None)
+        if entry is not None:
+            _, fut = entry
+            try:
+                fut.result()  # raises if extraction failed
+            except Exception as e:
+                print(f"  [ERROR] prefetched audio extract failed: {e} — retrying sync")
+                try:
+                    extract_audio(video, wav)
+                except Exception as e2:
+                    print(f"  [ERROR] audio extract failed: {e2}")
+                    failed += 1
+                    continue
+        else:
+            try:
+                extract_audio(video, wav)
+            except subprocess.CalledProcessError as e:
+                print(f"  [ERROR] audio extract failed: {str(e)[:160]}")
+                failed += 1
+                continue
+            except Exception as e:
+                print(f"  [ERROR] audio extract failed: {e}")
+                failed += 1
+                continue
+
         try:
-            extract_audio(video, wav)
             transcribe(wav, asr_json, asr_model)
             asr_to_srt(asr_json, raw_srt)
             print(f"  [OK] raw srt -> {raw_srt.relative_to(raw_dir.parent)}")
@@ -462,6 +502,16 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
             for p in (wav, asr_json):
                 p.unlink(missing_ok=True)
 
+        # Pipeline overlap: keep up to `depth` extractions running ahead so the
+        # GPU never waits on the SMB read + ffmpeg extract.
+        for ahead in range(idx + 1, min(idx + args.depth, len(videos)) + 1):
+            if ahead in futures:
+                continue
+            nv = videos[ahead - 1]
+            nwav = tmp_dir / f"{ahead:04d}_{nv.stem}.wav"
+            futures[ahead] = (nwav, extract_pool.submit(extract_audio, nv, nwav))
+
+    extract_pool.shutdown(wait=False)
     print(f"\nASR done: {done} ok, {skipped} skipped, {failed} failed")
     return 0
 
