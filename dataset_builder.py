@@ -404,13 +404,14 @@ def main() -> int:
 
     if args.stage in ("all", "asr"):
         return run_asr_stage(root, raw_dir, ref_dir, Path(args.tmp_dir), asr_model,
-                             args.limit, args.dry_run, args.skip_existing)
+                             args.limit, args.dry_run, args.skip_existing, args.depth)
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                              args.lm_studio_url, args.min_diff, args.limit, args.dry_run)
 
 
 def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
-                  asr_model: str, limit: int, dry_run: bool, skip_existing: bool = False) -> int:
+                  asr_model: str, limit: int, dry_run: bool,
+                  skip_existing: bool = False, depth: int = 3) -> int:
     videos = sorted(p for p in root.rglob("*")
                     if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("._"))
     if not videos:
@@ -432,7 +433,7 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
         return 0
 
     done = skipped = failed = 0
-    extract_pool = ThreadPoolExecutor(max_workers=args.depth,
+    extract_pool = ThreadPoolExecutor(max_workers=depth,
                                       thread_name_prefix="extract")
     futures: dict[int, tuple[Path, "concurrent.futures.Future"]] = {}
     for idx, video in enumerate(videos, 1):
@@ -504,7 +505,7 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
         # Pipeline overlap: keep up to `depth` extractions running ahead so the
         # GPU never waits on the SMB read + ffmpeg extract.
-        for ahead in range(idx + 1, min(idx + args.depth, len(videos)) + 1):
+        for ahead in range(idx + 1, min(idx + depth, len(videos)) + 1):
             if ahead in futures:
                 continue
             nv = videos[ahead - 1]
