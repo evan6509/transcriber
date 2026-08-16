@@ -424,7 +424,7 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
         # Mirror the library tree under raw_dir so the correction stage can
         # find glossaries via the original video's parent folder.
-        rel_out = rel.parent / f"{rel.stem}.en.srt"
+        rel_out = rel.parent / f"{rel.stem}.srt"
         wav = tmp_dir / f"{video.stem}.wav"
         asr_json = tmp_dir / f"{video.stem}.json"
         raw_srt = raw_dir / rel_out
@@ -455,9 +455,10 @@ def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
     if not raw_dir.is_dir():
         print(f"[ERROR] no raw/ dir at {raw_dir} — run the ASR stage first", file=sys.stderr)
         return 1
-    raw_srts = sorted(raw_dir.rglob("*.en.srt"))
+    raw_srts = sorted(raw_dir.rglob("*.srt"))
+    raw_srts = [p for p in raw_srts if ".corrected" not in p.name]
     if not raw_srts:
-        print(f"[ERROR] no *.en.srt files under {raw_dir}", file=sys.stderr)
+        print(f"[ERROR] no *.srt files under {raw_dir}", file=sys.stderr)
         return 1
     if limit:
         raw_srts = raw_srts[:limit]
