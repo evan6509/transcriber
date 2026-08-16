@@ -198,17 +198,26 @@ def transcribe_mac(wav: Path, json_out: Path, model: str) -> None:
     subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
 
 
+_CUDA_ASR = None  # (processor, model, device) — cached across videos
+
+
 def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
+    global _CUDA_ASR
     import torch  # lazy — CUDA machines only
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA ASR requires torch with CUDA (see --asr-model); "
                            "on macOS use mlx-qwen3-asr instead")
-    from transformers import AutoModelForMultimodalLM, AutoProcessor
+    if _CUDA_ASR is None:
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-    device = "cuda"
-    processor = AutoProcessor.from_pretrained(model)
-    asr_model = AutoModelForMultimodalLM.from_pretrained(model).to(device)
+        device = "cuda"
+        processor = AutoProcessor.from_pretrained(model)
+        asr_model = AutoModelForMultimodalLM.from_pretrained(model).to(device)
+        _CUDA_ASR = (processor, asr_model, device)
+        print(f"  [INFO] CUDA ASR model loaded (cached for the whole run)")
+    else:
+        processor, asr_model, device = _CUDA_ASR
     import numpy as np
     import soundfile as sf
 
@@ -222,14 +231,37 @@ def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
     seg_samples = 16000 * 30
     ASR_BATCH = 4
     starts = list(range(0, len(audio), seg_samples))
+    n_batches = (len(starts) + ASR_BATCH - 1) // ASR_BATCH
     chunks = []
+
+    # Double-buffer: a prep thread builds the NEXT batch's input features on
+    # the CPU while the GPU generates the current one — the GPU never idles
+    # waiting for feature extraction.
+    import queue as _queue
+
+    batch_q: "_queue.Queue" = _queue.Queue(maxsize=2)
+
+    def _prep():
+        try:
+            for b in range(0, len(starts), ASR_BATCH):
+                batch_starts = starts[b : b + ASR_BATCH]
+                segs = [audio[s : s + seg_samples] for s in batch_starts]
+                # Official Qwen3-ASR entry point (handles text/audio token
+                # alignment); accepts a list of audios -> batched inference.
+                inputs = processor.apply_transcription_request(audio=segs).to(device, asr_model.dtype)
+                batch_q.put((batch_starts, segs, inputs))
+        except Exception as e:  # noqa: BLE001
+            batch_q.put(e)
+
+    prep_thread = threading.Thread(target=_prep, daemon=True)
+    prep_thread.start()
+
     with torch.no_grad():
-        for b in range(0, len(starts), ASR_BATCH):
-            batch_starts = starts[b : b + ASR_BATCH]
-            segs = [audio[s : s + seg_samples] for s in batch_starts]
-            # Official Qwen3-ASR entry point (handles text/audio token alignment);
-            # accepts a list of audios -> batched inference.
-            inputs = processor.apply_transcription_request(audio=segs).to(device, asr_model.dtype)
+        for _ in range(n_batches):
+            item = batch_q.get()
+            if isinstance(item, Exception):
+                raise item
+            batch_starts, segs, inputs = item
             outputs = asr_model.generate(**inputs, max_new_tokens=512)
             seq_len = inputs["input_ids"].shape[1]
             for j, out in enumerate(outputs):
@@ -240,8 +272,9 @@ def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
                     chunks.append({"text": text,
                                    "start": s / sr,
                                    "end": min((s + len(segs[j])) / sr, len(audio) / sr)})
-    del asr_model
-    torch.cuda.empty_cache()
+    prep_thread.join()
+    # NOTE: the model is intentionally NOT freed here — it stays cached in
+    # _CUDA_ASR for the next video (the big per-video reload win).
     json_out.write_text(json.dumps({"segments": [], "chunks": chunks}), encoding="utf-8")
 
 
@@ -387,7 +420,7 @@ def main() -> int:
     ap.add_argument("--min-diff", action="store_true",
                     help="skip no-op chunks (raw == corrected) in training.jsonl")
     ap.add_argument("--limit", type=int, default=0, help="process only first N videos (test)")
-    ap.add_argument("--depth", type=int, default=3,
+    ap.add_argument("--depth", type=int, default=6,
                     help="how many videos ahead to extract audio (pipeline overlap)")
     ap.add_argument("--skip-existing", action="store_true",
                     help="skip videos that already have a raw srt in out-dir (resumable runs)")
@@ -451,9 +484,12 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
             skipped += 1
             continue
 
-        embedded = extract_embedded_subs(video, info, ref_dir)
-        if embedded:
-            print(f"  [INFO] extracted embedded subs -> {embedded.name}")
+        # Fire-and-forget: embedded-subs extraction is informational (reference
+        # copy only) — don't let it block the GPU between videos.
+        if info["subs"]:
+            threading.Thread(
+                target=extract_embedded_subs, args=(video, info, ref_dir), daemon=True
+            ).start()
 
         # Mirror the library tree under raw_dir so the correction stage can
         # find glossaries via the original video's parent folder.
