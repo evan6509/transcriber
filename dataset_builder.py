@@ -409,6 +409,23 @@ def correct_srt(srt_path: Path, glossary_text: str, out_path: Path, url: str,
 
 
 # --------------------------------------------------------------------------- #
+def _read_opencode_key() -> str | None:
+    """Read the opencode-go API key from ~/.config/opencode/opencode.jsonc."""
+    import re as _re
+    try:
+        cfg_text = Path.home().joinpath(".config/opencode/opencode.jsonc").read_text()
+        cfg_text = _re.sub(r"//[^\"]*$", "", cfg_text, flags=_re.MULTILINE)
+        cfg_text = _re.sub(r",\s*([}\]])", r"\1", cfg_text)
+        cfg = json.loads(cfg_text)
+        for _name, conf in cfg.get("provider", {}).items():
+            base = (conf.get("baseURL") or "").lower()
+            if "opencode.ai" in base:
+                return conf.get("apiKey") or conf.get("api_key")
+    except Exception:
+        return None
+    return None
+
+
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> int:
@@ -459,19 +476,7 @@ def main() -> int:
     # Auto-read the opencode-go API key if none passed (no secrets in chat).
     api_key = args.api_key
     if api_key is None and "opencode.ai" in args.lm_studio_url:
-        import re as _re
-        try:
-            cfg_text = Path.home().joinpath(
-                ".config/opencode/opencode.jsonc").read_text()
-            cfg_text = _re.sub(r"//.*", "", cfg_text)
-            cfg = json.loads(cfg_text)
-            for name, conf in cfg.get("provider", {}).items():
-                base = (conf.get("baseURL") or "").lower()
-                if "opencode.ai" in base:
-                    api_key = conf.get("apiKey") or conf.get("api_key")
-                    break
-        except Exception:
-            api_key = None
+        api_key = _read_opencode_key()
         if api_key:
             print("  [INFO] using opencode-go API key from opencode config")
 
