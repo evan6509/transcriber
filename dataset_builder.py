@@ -153,7 +153,11 @@ def probe_video(video: Path) -> dict:
 def has_english_audio(info: dict) -> bool:
     if not info["audio"]:
         return False
-    return any(lang == "eng" for lang in info["audio"]) or all(lang == "" for lang in info["audio"])
+    # Accept: explicit eng, OR all tracks untagged/und (many dub releases never
+    # tag the language — verified: "und"-tagged AoT files contain English dubs).
+    return any(lang == "eng" for lang in info["audio"]) or all(
+        lang in ("", "und") for lang in info["audio"]
+    )
 
 
 def extract_embedded_subs(video: Path, info: dict, out_dir: Path) -> Path | None:
