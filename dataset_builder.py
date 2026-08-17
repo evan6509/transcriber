@@ -135,6 +135,30 @@ def chunked(items: list, size: int):
         yield items[i : i + size]
 
 
+def _peak_until_seconds() -> float:
+    """Seconds until the current DeepSeek peak window ends, or 0 if off-peak.
+    Peak: 01-04 and 06-10 UTC (DeepSeek pricing)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    h = now.hour
+    if 1 <= h < 4:
+        end = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    elif 6 <= h < 10:
+        end = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    else:
+        return 0.0
+    return (end - now).total_seconds()
+
+
+def _sleep_off_peak() -> None:
+    """Block until off-peak (returns immediately when already off-peak)."""
+    wait = _peak_until_seconds()
+    if wait > 0:
+        hrs = wait / 3600
+        print(f"  [PEAK] sleeping {hrs:.1f}h until off-peak (04 or 10 UTC)...", flush=True)
+        time.sleep(wait)
+
+
 # --------------------------------------------------------------------------- #
 # Video probing
 # --------------------------------------------------------------------------- #
@@ -364,7 +388,7 @@ def server_has_loaded_model(chat_url: str) -> bool:
 def call_llm(prompt: str, url: str, model: str = "current",
              api_key: str | None = None) -> str:
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-               "temperature": 0.0, "max_tokens": 4000}
+               "temperature": 0.0, "max_tokens": 16000}
     data = http_json("POST", url, payload, api_key=api_key)
     choice = data["choices"][0]
     if choice.get("finish_reason") == "length":
@@ -471,6 +495,9 @@ def main() -> int:
     ap.add_argument("--skip-server-check", action="store_true",
                     help="skip the 'is a model loaded?' preflight (needed for cloud "
                          "APIs that have no loaded-model concept)")
+    ap.add_argument("--jsonl-out", default=None,
+                    help="path for training.jsonl (default: <out-dir>/training.jsonl; "
+                         "use a LOCAL path if the NAS file handle is stuck)")
     ap.add_argument("--asr-model", default=None,
                     help=f"ASR model (default: {ASR_MODEL_MAC if IS_MAC else ASR_MODEL_CUDA})")
     ap.add_argument("--min-diff", action="store_true",
@@ -503,7 +530,8 @@ def main() -> int:
                              args.limit, args.dry_run, args.skip_existing, args.depth)
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                              args.lm_studio_url, args.lm_studio_model, api_key,
-                             args.skip_server_check, args.min_diff, args.limit, args.dry_run)
+                             args.skip_server_check, args.jsonl_out, args.min_diff,
+                             args.limit, args.dry_run)
 
 
 def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
@@ -629,7 +657,7 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
 def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
                       chunk_size: int, lm_url: str, lm_model: str,
-                      api_key: str | None, skip_check: bool,
+                      api_key: str | None, skip_check: bool, jsonl_out: str | None,
                       min_diff: bool, limit: int, dry_run: bool) -> int:
     if not raw_dir.is_dir():
         print(f"[ERROR] no raw/ dir at {raw_dir} — run the ASR stage first", file=sys.stderr)
@@ -660,9 +688,11 @@ def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
         return 1
 
     n_total = n_changed = n_noop = 0
-    out_jsonl = open(out_dir / "training.jsonl", "w", encoding="utf-8")
+    jsonl_path = Path(jsonl_out) if jsonl_out else out_dir / "training.jsonl"
+    out_jsonl = open(jsonl_path, "w", encoding="utf-8", buffering=1)
     try:
         for idx, raw in enumerate(raw_srts, 1):
+            _sleep_off_peak()  # never bill peak-rate API calls
             rel = raw.relative_to(raw_dir)
             print(f"[{idx}/{len(raw_srts)}] {rel}")
             video_parent = root / rel.parent
