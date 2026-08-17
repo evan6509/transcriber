@@ -109,13 +109,24 @@ def glossary_summary(path: Path) -> str:
         return ""
     parts = []
     if isinstance(data, dict):
-        for key in ("characters", "aliases", "mishearings", "terms"):
+        chars = data.get("characters")
+        if isinstance(chars, dict):
+            entries = []
+            for name, aliases in list(chars.items())[:60]:
+                if isinstance(aliases, list) and aliases:
+                    entries.append(f"{name} (aka: {', '.join(str(a) for a in aliases[:12])})")
+                elif isinstance(aliases, str) and aliases:
+                    entries.append(f"{name} (aka: {aliases})")
+                else:
+                    entries.append(name)
+            if entries:
+                parts.append("characters: " + "; ".join(entries))
+        for key in ("mishearings", "terms", "locations"):
             v = data.get(key)
-            if isinstance(v, list):
+            if isinstance(v, list) and v:
                 parts.append(f"{key}: {', '.join(str(x) for x in v[:100])}")
-            elif isinstance(v, dict):
-                pairs = [f"{k}={v[k]}" for k in list(v)[:100] if isinstance(v[k], (str, int))]
-                parts.append(f"{key}: {', '.join(pairs)}")
+            elif isinstance(v, dict) and v:
+                parts.append(f"{key}: {', '.join(f'{k}={v[k]}' for k in list(v)[:100] if isinstance(v[k], (str, int)))}")
     return "\n".join(parts)
 
 
