@@ -23,14 +23,17 @@ compatible server already has loaded, and errors clearly if nothing is loaded.
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib import request as urlrequest
 
 IS_MAC = sys.platform == "darwin"
 
@@ -361,9 +364,25 @@ def http_json(method: str, url: str, payload=None, timeout: int = 600,
                "User-Agent": "OpenAI/Python 1.30.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urlrequest.Request(url, data=data, method=method, headers=headers)
-    with urlrequest.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < 4:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  [RETRY] HTTP {e.code}, waiting {wait:.1f}s (attempt {attempt+1}/5)")
+                time.sleep(wait)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < 4:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  [RETRY] {e.reason}, waiting {wait:.1f}s (attempt {attempt+1}/5)")
+                time.sleep(wait)
+                continue
+            raise
 
 
 def server_has_loaded_model(chat_url: str) -> bool:
