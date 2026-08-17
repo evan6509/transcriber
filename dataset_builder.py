@@ -36,7 +36,7 @@ IS_MAC = sys.platform == "darwin"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov"}
 CHUNK_SIZE = 20
-MAX_WORKERS = 4  # concurrent LLM correction chunks (local 27B on the Mac — keep gentle)
+MAX_WORKERS = 8  # concurrent LLM correction chunks (cloud API)
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 ASR_MODEL_MAC = "mlx-community/Qwen3-ASR-1.7B-8bit"
