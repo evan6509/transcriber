@@ -233,7 +233,7 @@ def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
     # input_features ~200MB; ASR_BATCH of them per generate() call keeps the
     # GPU busy (batch=1 on a 1.7B model underutilizes the card).
     seg_samples = 16000 * 30
-    ASR_BATCH = 4
+    ASR_BATCH = 8
     starts = list(range(0, len(audio), seg_samples))
     n_batches = (len(starts) + ASR_BATCH - 1) // ASR_BATCH
     chunks = []
@@ -321,7 +321,9 @@ def transcribe(wav: Path, json_out: Path, model: str) -> None:
 def http_json(method: str, url: str, payload=None, timeout: int = 600,
               api_key: str | None = None) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json",
+               # the opencode-go gateway 403s default Python/urllib UAs
+               "User-Agent": "OpenAI/Python 1.30.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urlrequest.Request(url, data=data, method=method, headers=headers)
@@ -414,13 +416,18 @@ def _read_opencode_key() -> str | None:
     import re as _re
     try:
         cfg_text = Path.home().joinpath(".config/opencode/opencode.jsonc").read_text()
-        cfg_text = _re.sub(r"//[^\"]*$", "", cfg_text, flags=_re.MULTILINE)
-        cfg_text = _re.sub(r",\s*([}\]])", r"\1", cfg_text)
+        # Strip // comments but NOT // inside quoted strings (URLs!)
+        cfg_text = re.sub(r'("(?:[^"\\]|\\.)*")|//.*',
+                          lambda m: m.group(1) or "", cfg_text)
+        cfg_text = re.sub(r",\s*([}\]])", r"\1", cfg_text)
         cfg = json.loads(cfg_text)
         for _name, conf in cfg.get("provider", {}).items():
-            base = (conf.get("baseURL") or "").lower()
+            # opencode stores provider settings under "options"
+            opts = conf.get("options") if isinstance(conf, dict) else {}
+            base = str((conf.get("baseURL") or opts.get("baseURL") or "")).lower()
             if "opencode.ai" in base:
-                return conf.get("apiKey") or conf.get("api_key")
+                return (conf.get("apiKey") or conf.get("api_key")
+                        or opts.get("apiKey") or opts.get("api_key"))
     except Exception:
         return None
     return None
