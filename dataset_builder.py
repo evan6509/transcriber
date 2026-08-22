@@ -23,20 +23,23 @@ compatible server already has loaded, and errors clearly if nothing is loaded.
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib import request as urlrequest
 
 IS_MAC = sys.platform == "darwin"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov"}
 CHUNK_SIZE = 20
-MAX_WORKERS = 3  # concurrent LLM correction chunks (gentle on LM Studio)
+MAX_WORKERS = 8  # concurrent LLM correction chunks (cloud API)
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 ASR_MODEL_MAC = "mlx-community/Qwen3-ASR-1.7B-8bit"
@@ -109,13 +112,24 @@ def glossary_summary(path: Path) -> str:
         return ""
     parts = []
     if isinstance(data, dict):
-        for key in ("characters", "aliases", "mishearings", "terms"):
+        chars = data.get("characters")
+        if isinstance(chars, dict):
+            entries = []
+            for name, aliases in list(chars.items())[:60]:
+                if isinstance(aliases, list) and aliases:
+                    entries.append(f"{name} (aka: {', '.join(str(a) for a in aliases[:12])})")
+                elif isinstance(aliases, str) and aliases:
+                    entries.append(f"{name} (aka: {aliases})")
+                else:
+                    entries.append(name)
+            if entries:
+                parts.append("characters: " + "; ".join(entries))
+        for key in ("mishearings", "terms", "locations"):
             v = data.get(key)
-            if isinstance(v, list):
+            if isinstance(v, list) and v:
                 parts.append(f"{key}: {', '.join(str(x) for x in v[:100])}")
-            elif isinstance(v, dict):
-                pairs = [f"{k}={v[k]}" for k in list(v)[:100] if isinstance(v[k], (str, int))]
-                parts.append(f"{key}: {', '.join(pairs)}")
+            elif isinstance(v, dict) and v:
+                parts.append(f"{key}: {', '.join(f'{k}={v[k]}' for k in list(v)[:100] if isinstance(v[k], (str, int)))}")
     return "\n".join(parts)
 
 
@@ -124,6 +138,30 @@ def chunked(items: list, size: int):
         raise ValueError("chunk size must be positive")
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def _peak_until_seconds() -> float:
+    """Seconds until the current DeepSeek peak window ends, or 0 if off-peak.
+    Peak: 01-04 and 06-10 UTC (DeepSeek pricing)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    h = now.hour
+    if 1 <= h < 4:
+        end = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    elif 6 <= h < 10:
+        end = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    else:
+        return 0.0
+    return (end - now).total_seconds()
+
+
+def _sleep_off_peak() -> None:
+    """Block until off-peak (returns immediately when already off-peak)."""
+    wait = _peak_until_seconds()
+    if wait > 0:
+        hrs = wait / 3600
+        print(f"  [PEAK] sleeping {hrs:.1f}h until off-peak (04 or 10 UTC)...", flush=True)
+        time.sleep(wait)
 
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +282,7 @@ def transcribe_cuda(wav: Path, json_out: Path, model: str) -> None:
     # input_features ~200MB; ASR_BATCH of them per generate() call keeps the
     # GPU busy (batch=1 on a 1.7B model underutilizes the card).
     seg_samples = 16000 * 30
-    ASR_BATCH = 4
+    ASR_BATCH = 8
     starts = list(range(0, len(audio), seg_samples))
     n_batches = (len(starts) + ASR_BATCH - 1) // ASR_BATCH
     chunks = []
@@ -332,12 +370,30 @@ def transcribe(wav: Path, json_out: Path, model: str) -> None:
 def http_json(method: str, url: str, payload=None, timeout: int = 600,
               api_key: str | None = None) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json",
+               # the opencode-go gateway 403s default Python/urllib UAs
+               "User-Agent": "OpenAI/Python 1.30.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urlrequest.Request(url, data=data, method=method, headers=headers)
-    with urlrequest.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < 4:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  [RETRY] HTTP {e.code}, waiting {wait:.1f}s (attempt {attempt+1}/5)")
+                time.sleep(wait)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < 4:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  [RETRY] {e.reason}, waiting {wait:.1f}s (attempt {attempt+1}/5)")
+                time.sleep(wait)
+                continue
+            raise
 
 
 def server_has_loaded_model(chat_url: str) -> bool:
@@ -362,7 +418,7 @@ def server_has_loaded_model(chat_url: str) -> bool:
 def call_llm(prompt: str, url: str, model: str = "current",
              api_key: str | None = None) -> str:
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-               "temperature": 0.0, "max_tokens": 4000}
+               "temperature": 0.0, "max_tokens": 16000}
     data = http_json("POST", url, payload, api_key=api_key)
     choice = data["choices"][0]
     if choice.get("finish_reason") == "length":
@@ -483,9 +539,12 @@ def _read_opencode_key() -> str | None:
         cfg_text = re.sub(r",\s*([}\]])", r"\1", cfg_text)
         cfg = json.loads(cfg_text)
         for _name, conf in cfg.get("provider", {}).items():
-            base = (conf.get("baseURL") or "").lower()
+            # opencode stores provider settings under "options"
+            opts = conf.get("options") if isinstance(conf, dict) else {}
+            base = str((conf.get("baseURL") or opts.get("baseURL") or "")).lower()
             if "opencode.ai" in base:
-                return conf.get("apiKey") or conf.get("api_key")
+                return (conf.get("apiKey") or conf.get("api_key")
+                        or opts.get("apiKey") or opts.get("api_key"))
     except Exception:
         return None
     return None
@@ -518,6 +577,9 @@ def main() -> int:
     ap.add_argument("--skip-server-check", action="store_true",
                     help="skip the 'is a model loaded?' preflight (needed for cloud "
                          "APIs that have no loaded-model concept)")
+    ap.add_argument("--jsonl-out", default=None,
+                    help="path for training.jsonl (default: <out-dir>/training.jsonl; "
+                         "use a LOCAL path if the NAS file handle is stuck)")
     ap.add_argument("--asr-model", default=None,
                     help=f"ASR model (default: {ASR_MODEL_MAC if IS_MAC else ASR_MODEL_CUDA})")
     ap.add_argument("--min-diff", action="store_true",
@@ -556,8 +618,8 @@ def main() -> int:
     if args.stage == "correct":
         return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                                  args.lm_studio_url, args.lm_studio_model, api_key,
-                                 args.skip_server_check, args.min_diff, args.limit,
-                                 args.dry_run)
+                                 args.skip_server_check, args.jsonl_out, args.min_diff,
+                                 args.limit, args.dry_run)
 
     asr_rc = run_asr_stage(root, raw_dir, ref_dir, tmp_dir, asr_model,
                            args.limit, args.dry_run, args.skip_existing, args.depth)
@@ -565,7 +627,8 @@ def main() -> int:
         return asr_rc
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                              args.lm_studio_url, args.lm_studio_model, api_key,
-                             args.skip_server_check, args.min_diff, args.limit, False)
+                             args.skip_server_check, args.jsonl_out, args.min_diff,
+                             args.limit, False)
 
 
 def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
@@ -697,7 +760,7 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
 
 def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
                       chunk_size: int, lm_url: str, lm_model: str,
-                      api_key: str | None, skip_check: bool,
+                      api_key: str | None, skip_check: bool, jsonl_out: str | None,
                       min_diff: bool, limit: int, dry_run: bool) -> int:
     if not raw_dir.is_dir():
         print(f"[ERROR] no raw/ dir at {raw_dir} — run the ASR stage first", file=sys.stderr)
@@ -728,9 +791,11 @@ def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
         return 1
 
     n_total = n_changed = n_noop = 0
-    out_jsonl = open(out_dir / "training.jsonl", "w", encoding="utf-8")
+    jsonl_path = Path(jsonl_out) if jsonl_out else out_dir / "training.jsonl"
+    out_jsonl = open(jsonl_path, "w", encoding="utf-8", buffering=1)
     try:
         for idx, raw in enumerate(raw_srts, 1):
+            _sleep_off_peak()  # never bill peak-rate API calls
             rel = raw.relative_to(raw_dir)
             print(f"[{idx}/{len(raw_srts)}] {rel}")
             video_parent = root / rel.parent
