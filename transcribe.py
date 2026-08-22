@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -32,6 +33,7 @@ CUDA_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 
 LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 LM_STUDIO_MODEL = "current"
+LLM_API_KEY: str | None = None
 CHUNK_SIZE = 20
 TIMEOUT = 600
 CORRECTED_HASHES_FILE = "corrected_hashes.json"
@@ -70,10 +72,12 @@ def _check_tool(name: str) -> None:
 
 def _check_tools() -> None:
     _check_tool("ffmpeg")
+    # ffprobe is used for audio/subtitle detection on every platform and for
+    # validating embedded output.
+    _check_tool("ffprobe")
     if IS_MAC:
         _check_tool("mlx-qwen3-asr")
         return
-    _check_tool("ffprobe")
     try:
         import torch
     except ImportError:
@@ -146,14 +150,14 @@ def _has_existing_srt(video: Path) -> bool:
     return _has_embedded_english_subs(video)
 
 
-def _classify(files: list[Path]) -> tuple[list[Path], list[Path]]:
+def _classify(files: list[Path], force: bool = False) -> tuple[list[Path], list[Path]]:
     pending: list[Path] = []
     skipped: list[Path] = []
     for f in sorted(files):
         if not _is_english_audio(f):
             skipped.append(f)
             continue
-        (skipped if _has_existing_srt(f) else pending).append(f)
+        (skipped if not force and _has_existing_srt(f) else pending).append(f)
     return pending, skipped
 
 
@@ -405,7 +409,7 @@ def _json_to_srt(json_path: Path, srt_path: Path) -> None:
                     entries.append((seg_slice[0]["start"], seg_slice[-1]["end"], sentence))
 
                 for i, (s_start, s_end, text) in enumerate(entries):
-                    padded_end = min(s_end + 0.25, entries[i + 1][0] if i + 1 < len(entries) else chunk_end)
+                    padded_end = min(s_end + 0.1, entries[i + 1][0] if i + 1 < len(entries) else chunk_end)
                     seq += 1
                     f.write(f"{seq}\n")
                     f.write(f"{_fmt_ts(s_start)} --> {_fmt_ts(padded_end)}\n")
@@ -527,19 +531,23 @@ If no corrections are needed, return an empty array: []
 """
 
 
-def _http_json(method: str, url: str, payload: dict | None = None, timeout: int | None = None) -> dict:
+def _http_json(method: str, url: str, payload: dict | None = None,
+               timeout: int | None = None, api_key: str | None = None) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method=method,
     )
     with urllib.request.urlopen(req, timeout=timeout if timeout is not None else TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _server_has_loaded_model(chat_url: str) -> bool:
+def _server_has_loaded_model(chat_url: str, api_key: str | None = None) -> bool:
     """True if the OpenAI-compatible server reports a loaded model.
 
     The script NEVER triggers a model load — it only uses what the server
@@ -548,7 +556,7 @@ def _server_has_loaded_model(chat_url: str) -> bool:
     """
     base = chat_url.rsplit("/chat/completions", 1)[0]  # .../v1
     try:
-        data = _http_json("GET", f"{base}/models", timeout=8)
+        data = _http_json("GET", f"{base}/models", timeout=8, api_key=api_key)
     except Exception:
         return False
     items = data.get("data") if isinstance(data, dict) else data
@@ -572,7 +580,8 @@ def _call_llm(prompt: str, endpoint: dict) -> str:
         "temperature": 0.0,
         "max_tokens": 4000,
     }
-    data = _http_json("POST", endpoint["base"], payload)
+    data = _http_json("POST", endpoint["base"], payload,
+                      api_key=endpoint.get("api_key"))
     choice = data["choices"][0]
     if choice.get("finish_reason") == "length":
         print("  [WARN] Response truncated (hit max_tokens) — chunk likely incomplete")
@@ -724,18 +733,180 @@ def _embed_srt(video: Path, srt: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def main() -> None:
-    global DRY_RUN, YES, CHUNK_SIZE, TIMEOUT, LM_STUDIO_URL, LM_STUDIO_MODEL
+def _models_url(chat_url: str) -> str:
+    base = chat_url.rsplit("/chat/completions", 1)[0].rstrip("/")
+    return f"{base}/models"
+
+
+def _list_models(chat_url: str, api_key: str | None = None) -> list[str]:
+    """Return model IDs from an OpenAI-compatible provider's /models endpoint."""
+    data = _http_json("GET", _models_url(chat_url), timeout=20, api_key=api_key)
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    model_ids = []
+    for item in items:
+        if isinstance(item, dict) and item.get("id"):
+            model_ids.append(str(item["id"]))
+    return list(dict.fromkeys(model_ids))
+
+
+def _is_local_endpoint(chat_url: str) -> bool:
+    host = (urlparse(chat_url).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _prompt_text(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value or default
+
+
+def _prompt_bool(label: str, default: bool = True) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        value = input(f"{label} [{suffix}]: ").strip().lower()
+        if not value:
+            return default
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+
+def _prompt_int(label: str, default: int, minimum: int = 1) -> int:
+    while True:
+        value = _prompt_text(label, str(default))
+        try:
+            parsed = int(value)
+        except ValueError:
+            print("Please enter a whole number.")
+            continue
+        if parsed >= minimum:
+            return parsed
+        print(f"Please enter a number greater than or equal to {minimum}.")
+
+
+def _prompt_secret(label: str) -> str:
+    import getpass
+
+    try:
+        return getpass.getpass(f"{label}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(1)
+
+
+def _choose_provider_model(endpoint: str, api_key: str | None,
+                           fallback: str) -> str:
+    print("\nFetching available models from the provider...")
+    try:
+        models = _list_models(endpoint, api_key)
+    except Exception as e:
+        print(f"Could not fetch models: {e}")
+        models = []
+    if not models:
+        print("The provider did not return any models.")
+        return _prompt_text("Model id", fallback)
+
+    print(f"Found {len(models)} model(s):")
+    for index, model in enumerate(models, 1):
+        print(f"  {index}. {model}")
+    while True:
+        choice = _prompt_text("Choose model number", "1")
+        try:
+            index = int(choice)
+        except ValueError:
+            index = 0
+        if 1 <= index <= len(models):
+            return models[index - 1]
+        print(f"Please choose a number from 1 to {len(models)}.")
+
+
+def _interactive_args(parser: argparse.ArgumentParser,
+                      existing: argparse.Namespace | None = None) -> argparse.Namespace:
+    """Collect a complete run configuration for users launching without flags."""
+    args = existing if existing is not None else parser.parse_args([])
+    default_model = MODEL if IS_MAC else CUDA_MODEL
+    default_root = str(Path.cwd())
+
+    print("\nTranscriber setup")
+    print("=" * 48)
+    while True:
+        input_dir = Path(_prompt_text("Video library", default_root)).expanduser()
+        if input_dir.is_dir():
+            break
+        print(f"Not a directory: {input_dir}")
+    args.input_dir = str(input_dir)
+
+    print("\nASR model")
+    print(f"  1. Default ({default_model})")
+    print("  2. Enter a custom model id")
+    while True:
+        choice = _prompt_text("Choose", "1")
+        if choice == "1":
+            args.asr_model = default_model
+            break
+        if choice == "2":
+            args.asr_model = _prompt_text("ASR model id", default_model)
+            break
+        print("Please choose 1 or 2.")
+
+    args.chunk_size = _prompt_int("Subtitle cues per correction request", args.chunk_size)
+    args.timeout = _prompt_int("LLM request timeout in seconds", args.timeout)
+
+    args.no_correction = not _prompt_bool("Correct names and terms with the LLM", True)
+    if not args.no_correction:
+        args.lm_studio_url = _prompt_text("LLM endpoint", args.lm_studio_url)
+        if args.api_key:
+            print("An API key is already configured through TRANSCRIBER_API_KEY or --api-key.")
+            use_existing = _prompt_bool("Use the configured API key", True)
+            if not use_existing:
+                args.api_key = _prompt_secret("API key (leave blank for local/no auth)")
+        else:
+            args.api_key = _prompt_secret("API key (leave blank for local/no auth)")
+        args.lm_studio_model = _choose_provider_model(
+            args.lm_studio_url, args.api_key, args.lm_studio_model
+        )
+    args.no_embedding = not _prompt_bool("Embed subtitles back into the videos", True)
+    args.keep_srt = _prompt_bool("Keep generated .srt files after embedding", False)
+    args.force = _prompt_bool("Reprocess videos that already have subtitle output", False)
+    args.dry_run = _prompt_bool("Perform a dry run only", False)
+    args.yes = False
+    args.interactive = False
+
+    print("\nRun summary")
+    print(f"  Library:  {args.input_dir}")
+    print(f"  ASR:      {args.asr_model}")
+    print(f"  Correct:  {'no' if args.no_correction else f'{args.lm_studio_model} @ {args.lm_studio_url}'}")
+    print(f"  API key:  {'configured' if args.api_key else 'none'}")
+    print(f"  Embed:    {'no' if args.no_embedding else 'yes'}")
+    print(f"  Keep SRT: {'yes' if args.keep_srt else 'no'}")
+    print(f"  Reprocess:{'yes' if args.force else 'no'}")
+    print(f"  Dry run:  {'yes' if args.dry_run else 'no'}")
+    if not _prompt_bool("Start this run", True):
+        print("Cancelled.")
+        raise SystemExit(0)
+    return args
+
+
+def main() -> int:
+    global DRY_RUN, YES, CHUNK_SIZE, TIMEOUT, LM_STUDIO_URL, LM_STUDIO_MODEL, LLM_API_KEY
     parser = argparse.ArgumentParser(
         prog="transcribe.py",
         description="Transcribe anime videos (macOS MLX / Linux CUDA), correct subtitles "
                     "against a glossary via LM Studio, and embed them.",
     )
+    parser.add_argument("--interactive", action="store_true",
+                        help="Launch the guided setup wizard.")
+    parser.add_argument("--input-dir", default=None,
+                        help="Video library root (default: current directory).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Scan and report what would be done without changing any files.")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Non-interactive: auto-accept the default answer for every prompt.")
-    parser.add_argument("--asr-model", default=(MODEL if IS_MAC else CUDA_MODEL),
+    parser.add_argument("--asr-model", default=None,
                         help=f"ASR model id (default: {MODEL if IS_MAC else CUDA_MODEL}).")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                         help=f"Subtitle cues per correction chunk (default: {CHUNK_SIZE}).")
@@ -745,7 +916,27 @@ def main() -> None:
                         help=f"OpenAI-compatible chat completions endpoint (default: {LM_STUDIO_URL}).")
     parser.add_argument("--lm-studio-model", default=LM_STUDIO_MODEL,
                         help=f"LM Studio model id (default: {LM_STUDIO_MODEL}).")
+    parser.add_argument("--api-key", default=os.environ.get("TRANSCRIBER_API_KEY"),
+                        help="Bearer token for cloud LLM APIs (prefer TRANSCRIBER_API_KEY).")
+    parser.add_argument("--no-correction", action="store_true",
+                        help="Skip glossary/LLM correction.")
+    parser.add_argument("--no-embedding", action="store_true",
+                        help="Keep subtitles as files; do not modify video containers.")
+    parser.add_argument("--keep-srt", action="store_true",
+                        help="Keep generated .srt files after embedding.")
+    parser.add_argument("--force", action="store_true",
+                        help="Reprocess files even when subtitle output already exists.")
     args = parser.parse_args()
+
+    if args.interactive or len(sys.argv) == 1:
+        args = _interactive_args(parser, args)
+
+    if args.asr_model is None:
+        args.asr_model = MODEL if IS_MAC else CUDA_MODEL
+    if args.chunk_size <= 0:
+        parser.error("--chunk-size must be positive")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
 
     DRY_RUN = args.dry_run
     YES = args.yes
@@ -753,12 +944,16 @@ def main() -> None:
     TIMEOUT = args.timeout
     LM_STUDIO_URL = args.lm_studio_url
     LM_STUDIO_MODEL = args.lm_studio_model
+    LLM_API_KEY = args.api_key
 
     _check_tools()
 
-    root = Path(os.getcwd())
+    root = Path(args.input_dir or os.getcwd()).expanduser()
+    if not root.is_dir():
+        parser.error(f"input directory does not exist: {root}")
+    root = root.resolve()
     all_files = _scan_videos(root)
-    pending, skipped = _classify(all_files)
+    pending, skipped = _classify(all_files, force=args.force)
     total = len(all_files)
     pending_count = len(pending)
     skipped_count = len(skipped)
@@ -772,6 +967,7 @@ def main() -> None:
     succeeded: list[str] = []
     failed: list[str] = []
     created_srts: list[Path] = []
+    correction_failed = 0
 
     for i, video in enumerate(pending, 1):
         name = video.name
@@ -820,12 +1016,12 @@ def main() -> None:
             print(f"    - {name}")
     print("=" * 48)
 
-    if not created_srts:
+    if not args.no_correction and not created_srts:
         for p in sorted(root.rglob("*.srt")):
             if ".corrected" not in p.stem and not _in_excluded(p, root) and not _is_appledouble(p):
                 created_srts.append(p)
 
-    if created_srts:
+    if not args.no_correction and created_srts:
         print()
         print("=" * 48)
         print("  Correction Phase")
@@ -872,14 +1068,17 @@ def main() -> None:
                 skipped_already += 1
                 continue
             to_correct.append((srt_path, glossary_text))
-        endpoints = [{"base": LM_STUDIO_URL, "model": LM_STUDIO_MODEL}]
-        if to_correct and not DRY_RUN and not _server_has_loaded_model(endpoints[0]["base"]):
+        endpoints = [{"base": LM_STUDIO_URL, "model": LM_STUDIO_MODEL,
+                      "api_key": LLM_API_KEY}]
+        if (to_correct and not DRY_RUN and _is_local_endpoint(endpoints[0]["base"])
+                and not _server_has_loaded_model(endpoints[0]["base"], LLM_API_KEY)):
             print("  [ERROR] No model is loaded in LM Studio (nothing served at "
                   f"{endpoints[0]['base']}). Load a model first, then re-run — "
                   "the script will NOT load one for you.")
             print("  Skipping the correction phase.")
             corrected_ok = 0
-            corrected_fail = 0
+            corrected_fail = 1
+            correction_failed = 1
         else:
             corrected_ok = 0
             corrected_fail = 0
@@ -896,6 +1095,7 @@ def main() -> None:
                 except Exception as e:
                     print(f"  [ERROR] {srt_path.name}: {e}")
                     corrected_fail += 1
+            correction_failed = corrected_fail
         print()
         parts = []
         if corrected_ok:
@@ -925,11 +1125,16 @@ def main() -> None:
             print("  Would prompt to replace raw .srts with corrected versions.")
             print("=" * 48)
 
+    if args.no_embedding:
+        print("\nEmbed phase skipped (--no-embedding).")
+        return 1 if failed or correction_failed else 0
+
     print()
     print("=" * 48)
     print("  Embed Phase")
     print("=" * 48)
     embedded = 0
+    embedding_failed = 0
     for video in sorted(_scan_videos(root)):
         if _has_embedded_english_subs(video):
             continue
@@ -937,20 +1142,25 @@ def main() -> None:
         if not srt.exists():
             continue
         if DRY_RUN:
-            print(f"  Would embed {srt.name} into {video.name}, then delete {srt.name}")
+            action = "delete" if not args.keep_srt else "keep"
+            print(f"  Would embed {srt.name} into {video.name}, then {action} the SRT")
             embedded += 1
             continue
         print(f"  Embedding {srt.name} into {video.name}...")
         try:
             _embed_srt(video, srt)
-            srt.unlink()
+            if not args.keep_srt:
+                srt.unlink()
             embedded += 1
-        except subprocess.CalledProcessError as e:
-            msg = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr)
+        except (subprocess.CalledProcessError, RuntimeError, json.JSONDecodeError) as e:
+            stderr = getattr(e, "stderr", None)
+            msg = stderr.decode() if isinstance(stderr, bytes) else str(stderr or e)
             print(f"  [ERROR] Failed to embed {srt.name}: {msg[:200]}")
+            embedding_failed += 1
     print(f"  Embedded {embedded} subtitle file(s).")
     print("=" * 48)
+    return 1 if failed or correction_failed or embedding_failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
