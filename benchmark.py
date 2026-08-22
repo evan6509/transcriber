@@ -24,6 +24,8 @@ Usage:
       --holdout 5
 """
 import argparse
+import difflib
+import hashlib
 import json
 import random
 import re
@@ -37,63 +39,149 @@ import dataset_builder as db  # reuse parse_srt, correct_srt, glossary helpers
 def word_acc(hyp: str, ref: str) -> float:
     a = hyp.split()
     b = ref.split()
-    n = max(len(a), len(b), 1)
-    # normalized Levenshtein-ish (sequence matcher is close enough + cheap)
-    sm = __import__("difflib").SequenceMatcher(None, a, b)
-    return sm.ratio()
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"[\w]+(?:['’\-][\w]+)*", text.casefold())
+
+
+def _glossary_terms(glossary_text: str) -> set[tuple[str, ...]]:
+    """Extract likely canonical/alias terms from the rendered glossary."""
+    terms: set[tuple[str, ...]] = set()
+    ignored = {"characters", "aliases", "mishearings", "terms", "locations",
+               "location", "term", "also", "seen", "as", "none"}
+    for line in glossary_text.splitlines():
+        line = line.strip().lstrip("- ")
+        line = re.sub(r"\(also seen as:", ",", line, flags=re.IGNORECASE)
+        if ":" in line:
+            line = line.split(":", 1)[1]
+        line = re.sub(r"\((?:location|term)\)", "", line, flags=re.IGNORECASE)
+        for part in re.split(r"[,=]", line):
+            tokens = tuple(t for t in _tokens(part) if t not in ignored)
+            if tokens:
+                terms.add(tokens)
+    return terms
+
+
+def _contains_term(tokens: list[str], terms: set[tuple[str, ...]]) -> bool:
+    for term in terms:
+        width = len(term)
+        if width == 0:
+            continue
+        if any(tuple(tokens[i : i + width]) == term for i in range(len(tokens) - width + 1)):
+            return True
+    return False
 
 
 def term_fix_recall(raw_text: str, ref_text: str, model_text: str, glossary_text: str) -> float:
-    """Of the glossary terms that CHANGED between raw and ref, how many did the
-    model also change? (i.e., did it apply the same glossary fixes)"""
-    terms = set()
-    for line in glossary_text.splitlines():
-        for part in re.split(r"[:=,]", line):
-            part = part.strip()
-            if part and len(part) > 1:
-                terms.add(part)
-    changed = set()
-    raw_words = set(raw_text.split())
-    ref_words = set(ref_text.split())
-    for w in raw_words - ref_words:
-        for t in terms:
-            if t.lower() in w.lower():
-                changed.add(t.lower())
-                break
-    if not changed:
-        return 1.0  # nothing to fix — trivially perfect
-    model_words = set(model_text.split())
-    fixed = 0
-    for t in changed:
-        # model removed/changed the term? check the raw word is gone
-        if not any(t.lower() in w.lower() for w in model_words & raw_words):
-            fixed += 1
-    return fixed / len(changed)
+    """Recall of glossary-related raw->reference replacements.
+
+    The reference side identifies the canonical term. A model gets credit only
+    when that canonical term appears in its output, so a raw misspelling such
+    as ``Taika`` -> ``Taiki`` is measured correctly.
+    """
+    raw_tokens = _tokens(raw_text)
+    ref_tokens = _tokens(ref_text)
+    model_tokens = _tokens(model_text)
+    terms = _glossary_terms(glossary_text)
+    expected: set[tuple[str, ...]] = set()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+        None, raw_tokens, ref_tokens
+    ).get_opcodes():
+        if tag == "equal":
+            continue
+        ref_span = ref_tokens[j1:j2]
+        if _contains_term(ref_span, terms):
+            for term in terms:
+                width = len(term)
+                if any(tuple(ref_span[i : i + width]) == term
+                       for i in range(len(ref_span) - width + 1)):
+                    expected.add(term)
+    if not expected:
+        return 1.0  # no glossary-linked reference change in this cue
+    fixed = sum(
+        1 for term in expected
+        if any(tuple(model_tokens[i : i + len(term)]) == term
+               for i in range(len(model_tokens) - len(term) + 1))
+    )
+    return fixed / len(expected)
 
 
 def over_change(hyp: str, ref: str, raw: str) -> float:
     """Fraction of words the model changed that the reference did NOT change."""
     raw_words = raw.split()
-    ref_words = ref.split()
-    hyp_words = hyp.split()
-    if not raw_words:
+    if not raw_words and not hyp.split():
         return 0.0
-    ref_changed = set()
-    for i, w in enumerate(raw_words):
-        if i < len(ref_words) and ref_words[i] != w:
-            ref_changed.add(i)
-    hyp_changed = set()
-    for i, w in enumerate(raw_words):
-        if i < len(hyp_words) and hyp_words[i] != w:
-            hyp_changed.add(i)
+    def changed_positions(target: str) -> set[int]:
+        changed = set()
+        for tag, i1, i2, _j1, _j2 in difflib.SequenceMatcher(
+            None, raw_words, target.split()
+        ).get_opcodes():
+            if tag != "equal":
+                changed.update(range(i1, i2))
+                if tag == "insert":
+                    changed.add(i1)
+        return changed
+
+    ref_changed = changed_positions(ref)
+    hyp_changed = changed_positions(hyp)
     if not hyp_changed:
         return 0.0
     return len(hyp_changed - ref_changed) / len(hyp_changed)
 
 
 def chunk_align(raw_cues, ref_cues, model_cues):
-    n = min(len(raw_cues), len(ref_cues), len(model_cues))
-    return raw_cues[:n], ref_cues[:n], model_cues[:n]
+    """Align by cue id and retain missing/extra cues for scoring."""
+    def by_id(cues):
+        return {cue["id"]: cue for cue in cues}
+
+    raw_by_id, ref_by_id, model_by_id = map(by_id, (raw_cues, ref_cues, model_cues))
+    ids = list(dict.fromkeys(
+        cue["id"]
+        for cues in (raw_cues, ref_cues, model_cues)
+        for cue in cues
+    ))
+
+    def cue_or_empty(mapping, cue_id):
+        return mapping.get(cue_id, {"id": cue_id, "text": ""})
+
+    return (
+        [cue_or_empty(raw_by_id, cue_id) for cue_id in ids],
+        [cue_or_empty(ref_by_id, cue_id) for cue_id in ids],
+        [cue_or_empty(model_by_id, cue_id) for cue_id in ids],
+    )
+
+
+def _normalise_source(value: str) -> str:
+    value = value.replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value
+
+
+def _training_sources(path: Path) -> set[str]:
+    sources = set()
+    with path.open(encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"invalid JSON in {path} line {line_no}: {e}") from e
+            source = item.get("source")
+            if source:
+                sources.add(_normalise_source(str(source)))
+    if not sources:
+        raise ValueError(f"training manifest {path} contains no source fields")
+    return sources
+
+
+def _safe_model_slug(model: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", model).strip("._") or "model"
+    digest = hashlib.sha1(model.encode("utf-8")).hexdigest()[:8]
+    return f"{slug[:80]}_{digest}"
 
 
 def main() -> int:
@@ -109,8 +197,19 @@ def main() -> int:
     ap.add_argument("--holdout", type=int, default=5, help="episodes to hold out")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--chunk-size", type=int, default=db.CHUNK_SIZE)
+    ap.add_argument("--train-jsonl", default=None,
+                    help="training manifest to exclude (default: OUT_DIR/training.jsonl)")
+    ap.add_argument("--allow-overlap", action="store_true",
+                    help="allow benchmarking examples that are in the training manifest")
     ap.add_argument("--png", default=None, help="output PNG path (default: benchmark.png)")
     args = ap.parse_args()
+
+    if args.holdout <= 0:
+        ap.error("--holdout must be positive")
+    if args.chunk_size <= 0:
+        ap.error("--chunk-size must be positive")
+    if args.model_a == args.model_b:
+        ap.error("--model-a and --model-b must be different")
 
     root = Path(args.dir)
     out_dir = Path(args.out_dir)
@@ -130,6 +229,28 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
+    train_jsonl = Path(args.train_jsonl) if args.train_jsonl else out_dir / "training.jsonl"
+    if not args.allow_overlap:
+        if not train_jsonl.is_file():
+            print(f"[ERROR] training manifest not found: {train_jsonl}. "
+                  "Create a train/holdout split or pass --allow-overlap.",
+                  file=sys.stderr)
+            return 1
+        try:
+            train_sources = _training_sources(train_jsonl)
+        except ValueError as e:
+            print(f"[ERROR] {e}", file=sys.stderr)
+            return 1
+        paired = [
+            (raw, ref) for raw, ref in paired
+            if _normalise_source(str(raw.relative_to(raw_dir))) not in train_sources
+        ]
+        if not paired:
+            print("[ERROR] no held-out pairs remain after excluding training sources. "
+                  "Create a true holdout split or pass --allow-overlap.",
+                  file=sys.stderr)
+            return 1
+
     rng = random.Random(args.seed)
     rng.shuffle(paired)
     holdout = paired[: args.holdout]
@@ -145,6 +266,7 @@ def main() -> int:
         return 1
 
     models = [args.model_a, args.model_b]
+    model_slugs = {model: _safe_model_slug(model) for model in models}
     results = {m: {"word_acc": [], "similarity": [], "term_recall": [], "over_change": []}
                for m in models}
 
@@ -160,16 +282,20 @@ def main() -> int:
         raw_cues = db.parse_srt(raw)
         ref_cues = db.parse_srt(ref)
         for model in models:
-            tmp = raw.with_suffix(f".bench_{model}.srt")
+            tmp = raw.with_suffix(f".bench_{model_slugs[model]}.srt")
             tmp.parent.mkdir(parents=True, exist_ok=True)
             try:
-                db.correct_srt(raw, glossary_text, tmp, args.endpoint, model, api_key)
+                db.correct_srt(raw, glossary_text, tmp, args.endpoint, model, api_key,
+                               args.chunk_size)
                 model_cues = db.parse_srt(tmp)
+                if len(model_cues) != len(raw_cues):
+                    print(f"  [WARN] {model}: cue count {len(model_cues)} vs "
+                          f"raw {len(raw_cues)}; missing/extra cues will be scored")
                 raw_c, ref_c, model_c = chunk_align(raw_cues, ref_cues, model_cues)
                 for rc, rf, rm in zip(raw_c, ref_c, model_c):
                     results[model]["word_acc"].append(word_acc(rm["text"], rf["text"]))
                     results[model]["similarity"].append(
-                        __import__("difflib").SequenceMatcher(
+                        difflib.SequenceMatcher(
                             None, rm["text"], rf["text"]).ratio())
                     results[model]["term_recall"].append(
                         term_fix_recall(rc["text"], rf["text"], rm["text"], glossary_text))

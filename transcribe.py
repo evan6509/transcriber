@@ -673,6 +673,15 @@ def _embed_srt(video: Path, srt: Path) -> None:
     fmt = _FMT_MAP.get(video.suffix.lower())
     if codec is None or fmt is None:
         return
+    subtitle_probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-select_streams", "s",
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(video)],
+        check=True, capture_output=True, text=True,
+    )
+    existing_subtitle_count = sum(
+        1 for line in subtitle_probe.stdout.splitlines() if line.strip()
+    )
+    new_subtitle_index = existing_subtitle_count
     # Write temp file in the SAME directory with a valid .mkv/.mp4/.mov extension
     # (CIFS rejects .tmp extensions; ffmpeg can't guess the format)
     tmp = video.with_suffix(".embed_tmp" + video.suffix)
@@ -683,20 +692,36 @@ def _embed_srt(video: Path, srt: Path) -> None:
         # so dual-audio tracks, chapter data, etc. are preserved
         "-map", "0", "-map", "1",
         "-c", "copy", "-c:s", codec,
-        "-metadata:s:s:0", "language=eng",
+        f"-metadata:s:s:{new_subtitle_index}", "language=eng",
         "-f", fmt,
         str(tmp),
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
-    # Verify the temp file is valid before replacing the original
-    verify = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-show_entries", "stream=codec_type", "-of", "csv", str(tmp)],
-        capture_output=True, text=True
-    )
-    if verify.returncode != 0 or not verify.stdout.strip():
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        # Verify the temp file is valid and contains the newly added subtitle
+        # before replacing the original.
+        verify = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "s",
+             "-show_entries", "stream=codec_type:stream_tags=language",
+             "-of", "json", str(tmp)],
+            check=True, capture_output=True, text=True,
+        )
+        streams = json.loads(verify.stdout).get("streams", [])
+        if len(streams) <= existing_subtitle_count:
+            raise RuntimeError(
+                f"Verification failed for {tmp.name}: new subtitle missing "
+                "— original preserved"
+            )
+        if streams[new_subtitle_index].get("tags", {}).get("language") not in (
+            "eng", "en", "English"
+        ):
+            raise RuntimeError(
+                f"Verification failed for {tmp.name}: new subtitle is not tagged "
+                "English — original preserved"
+            )
+        os.replace(tmp, video)
+    finally:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"Verification failed for {tmp.name} — original preserved")
-    os.replace(tmp, video)
 
 
 def main() -> None:

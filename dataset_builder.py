@@ -10,7 +10,7 @@ Usage:
 
 Flow per video:
     1. Probe (ffprobe): English audio? embedded subtitle streams?
-    2. Extract audio (ffmpeg) -> 16kHz mono WAV (in out-dir/tmp)
+    2. Extract audio (ffmpeg) -> 16kHz mono WAV (in --tmp-dir)
     3. ASR -> raw .srt (macOS: mlx-qwen3-asr; Linux+NVIDIA: CUDA torch)
     4. LLM correction (OpenAI-compatible, whatever LM Studio has loaded)
        -> corrected .srt
@@ -120,6 +120,8 @@ def glossary_summary(path: Path) -> str:
 
 
 def chunked(items: list, size: int):
+    if size <= 0:
+        raise ValueError("chunk size must be positive")
     for i in range(0, len(items), size):
         yield items[i : i + size]
 
@@ -160,7 +162,8 @@ def has_english_audio(info: dict) -> bool:
     )
 
 
-def extract_embedded_subs(video: Path, info: dict, out_dir: Path) -> Path | None:
+def extract_embedded_subs(video: Path, info: dict, out_dir: Path,
+                          root: Path | None = None) -> Path | None:
     """Extract the first embedded subtitle stream to out_dir (best effort)."""
     if not info["subs"]:
         return None
@@ -171,7 +174,15 @@ def extract_embedded_subs(video: Path, info: dict, out_dir: Path) -> Path | None
             break
     if target is None:
         target = info["subs"][0]
-    dest = out_dir / f"{video.stem}.embedded.srt"
+    if root is not None:
+        try:
+            rel_parent = video.relative_to(root).parent
+        except ValueError:
+            rel_parent = Path()
+    else:
+        rel_parent = Path()
+    dest = out_dir / rel_parent / f"{video.stem}.embedded.srt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
@@ -387,12 +398,13 @@ def apply_corrections(cues: list[dict], corrections: list[dict]) -> int:
 
 
 def correct_srt(srt_path: Path, glossary_text: str, out_path: Path, url: str,
-                model: str = "current", api_key: str | None = None) -> int:
+                model: str = "current", api_key: str | None = None,
+                chunk_size: int | None = None) -> int:
     cues = parse_srt(srt_path)
     if not cues:
         raise ValueError("no cues parsed")
     total = 0
-    chunks = list(chunked(cues, CHUNK_SIZE))
+    chunks = list(chunked(cues, chunk_size if chunk_size is not None else CHUNK_SIZE))
     workers = min(len(chunks), MAX_WORKERS)
     prompts = []
     for idx, chunk in enumerate(chunks, 1):
@@ -411,11 +423,64 @@ def correct_srt(srt_path: Path, glossary_text: str, out_path: Path, url: str,
 # --------------------------------------------------------------------------- #
 def _read_opencode_key() -> str | None:
     """Read the opencode-go API key from ~/.config/opencode/opencode.jsonc."""
-    import re as _re
+
+    def strip_jsonc_comments(text: str) -> str:
+        """Remove JSONC comments without treating // inside strings as comments."""
+        out = []
+        in_string = False
+        escaped = False
+        in_line_comment = False
+        in_block_comment = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if in_line_comment:
+                if ch == "\n":
+                    in_line_comment = False
+                    out.append(ch)
+                i += 1
+                continue
+            if in_block_comment:
+                if ch == "*" and nxt == "/":
+                    in_block_comment = False
+                    i += 2
+                else:
+                    if ch == "\n":
+                        out.append(ch)
+                    i += 1
+                continue
+            if in_string:
+                out.append(ch)
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+                i += 1
+            elif ch == "/" and nxt == "/":
+                in_line_comment = True
+                i += 2
+            elif ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
+
     try:
-        cfg_text = Path.home().joinpath(".config/opencode/opencode.jsonc").read_text()
-        cfg_text = _re.sub(r"//[^\"]*$", "", cfg_text, flags=_re.MULTILINE)
-        cfg_text = _re.sub(r",\s*([}\]])", r"\1", cfg_text)
+        cfg_text = Path.home().joinpath(".config/opencode/opencode.jsonc").read_text(
+            encoding="utf-8"
+        )
+        cfg_text = strip_jsonc_comments(cfg_text)
+        cfg_text = re.sub(r",\s*([}\]])", r"\1", cfg_text)
         cfg = json.loads(cfg_text)
         for _name, conf in cfg.get("provider", {}).items():
             base = (conf.get("baseURL") or "").lower()
@@ -465,12 +530,17 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="scan + plan only, no processing")
     args = ap.parse_args()
 
+    if args.chunk_size <= 0:
+        ap.error("--chunk-size must be positive")
+    if args.depth <= 0:
+        ap.error("--depth must be positive")
+
     root = Path(args.dir)
     out_dir = Path(args.out_dir)
     raw_dir = out_dir / "raw"
     corr_dir = out_dir / "corrected"
     ref_dir = out_dir / "reference"
-    tmp_dir = out_dir / "tmp"
+    tmp_dir = Path(args.tmp_dir)
     asr_model = args.asr_model or (ASR_MODEL_MAC if IS_MAC else ASR_MODEL_CUDA)
 
     # Auto-read the opencode-go API key if none passed (no secrets in chat).
@@ -480,12 +550,22 @@ def main() -> int:
         if api_key:
             print("  [INFO] using opencode-go API key from opencode config")
 
-    if args.stage in ("all", "asr"):
-        return run_asr_stage(root, raw_dir, ref_dir, Path(args.tmp_dir), asr_model,
+    if args.stage == "asr":
+        return run_asr_stage(root, raw_dir, ref_dir, tmp_dir, asr_model,
                              args.limit, args.dry_run, args.skip_existing, args.depth)
+    if args.stage == "correct":
+        return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
+                                 args.lm_studio_url, args.lm_studio_model, api_key,
+                                 args.skip_server_check, args.min_diff, args.limit,
+                                 args.dry_run)
+
+    asr_rc = run_asr_stage(root, raw_dir, ref_dir, tmp_dir, asr_model,
+                           args.limit, args.dry_run, args.skip_existing, args.depth)
+    if asr_rc != 0 or args.dry_run:
+        return asr_rc
     return run_correct_stage(root, raw_dir, corr_dir, out_dir, args.chunk_size,
                              args.lm_studio_url, args.lm_studio_model, api_key,
-                             args.skip_server_check, args.min_diff, args.limit, args.dry_run)
+                             args.skip_server_check, args.min_diff, args.limit, False)
 
 
 def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
@@ -517,6 +597,9 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
     # bursty 6-way spikes, and the GPU never waits on a full-batch refill.
     extract_pool = ThreadPoolExecutor(max_workers=min(3, depth),
                                       thread_name_prefix="extract")
+    reference_pool = ThreadPoolExecutor(max_workers=3,
+                                         thread_name_prefix="reference")
+    reference_futures = []
     futures: dict[int, tuple[Path, "concurrent.futures.Future"]] = {}
     # Prime the pipeline: submit the first `depth` extractions before the loop
     # so the GPU starts as soon as the first wav lands.
@@ -542,9 +625,9 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
         # Fire-and-forget: embedded-subs extraction is informational (reference
         # copy only) — don't let it block the GPU between videos.
         if info["subs"]:
-            threading.Thread(
-                target=extract_embedded_subs, args=(video, info, ref_dir), daemon=True
-            ).start()
+            reference_futures.append(
+                reference_pool.submit(extract_embedded_subs, video, info, ref_dir, root)
+            )
 
         # Mirror the library tree under raw_dir so the correction stage can
         # find glossaries via the original video's parent folder.
@@ -604,7 +687,10 @@ def run_asr_stage(root: Path, raw_dir: Path, ref_dir: Path, tmp_dir: Path,
             for p in (wav, asr_json):
                 p.unlink(missing_ok=True)
 
-    extract_pool.shutdown(wait=False)
+    extract_pool.shutdown(wait=True)
+    for wav_path, _future in futures.values():
+        wav_path.unlink(missing_ok=True)
+    reference_pool.shutdown(wait=True)
     print(f"\nASR done: {done} ok, {skipped} skipped, {failed} failed")
     return 0
 
@@ -656,7 +742,9 @@ def run_correct_stage(root: Path, raw_dir: Path, corr_dir: Path, out_dir: Path,
             corr = corr_dir / rel.parent / f"{rel.stem}.corrected.srt"
             corr.parent.mkdir(parents=True, exist_ok=True)
             try:
-                applied = correct_srt(raw, glossary_text, corr, lm_url, lm_model, api_key)
+                applied = correct_srt(
+                    raw, glossary_text, corr, lm_url, lm_model, api_key, chunk_size
+                )
                 print(f"  [OK] corrected ({applied} fixes)")
             except Exception as e:
                 print(f"  [ERROR] correction failed: {e}")
